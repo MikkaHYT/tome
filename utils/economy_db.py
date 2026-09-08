@@ -48,6 +48,25 @@ SCALES = [
 ]
 
 
+def safe_to_int(val: Any) -> int:
+    if val is None:
+        return 0
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(Decimal(str(val)))
+    s = str(val).strip()
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return int(Decimal(s))
+        except Exception:
+            return 0
+
+
 def parse_bet(arg: str, user_wallet: int) -> int | None:
     if not arg:
         return None
@@ -61,7 +80,6 @@ def parse_bet(arg: str, user_wallet: int) -> int | None:
     if raw == "75%":
         return max(1, (user_wallet * 3) // 4) if user_wallet > 0 else None
 
-    # Handle short single-letter aliases first
     if raw.endswith("q") and not raw.endswith(("quad", "quin")):
         num_part = raw[:-1].strip()
         try:
@@ -100,33 +118,33 @@ def parse_bet(arg: str, user_wallet: int) -> int | None:
                     return None
 
     try:
-        val = int(raw.replace(",", ""))
+        val = int(Decimal(raw.replace(",", "")))
         return val if val > 0 else None
-    except ValueError:
+    except Exception:
         return None
 
 
-def format_cash(amount: int | float) -> str:
-    amount = int(amount)
+def format_cash(amount: Any) -> str:
+    amount = safe_to_int(amount)
     abs_amt = abs(amount)
     sign = "-" if amount < 0 else ""
 
     for full_name, _, multiplier in SCALES:
         if abs_amt >= multiplier:
-            val = abs_amt / multiplier
+            val = Decimal(abs_amt) / Decimal(multiplier)
             return f"🪙 **{sign}{val:.2f} {full_name}**"
 
     return f"🪙 **{sign}{abs_amt:,}**"
 
 
-def format_cash_short(amount: int | float) -> str:
-    amount = int(amount)
+def format_cash_short(amount: Any) -> str:
+    amount = safe_to_int(amount)
     abs_amt = abs(amount)
     sign = "-" if amount < 0 else ""
 
     for _, short_name, multiplier in SCALES:
         if abs_amt >= multiplier:
-            val = abs_amt / multiplier
+            val = Decimal(abs_amt) / Decimal(multiplier)
             return f"{sign}{val:.2f} {short_name}"
 
     return f"{sign}{abs_amt:,}"
@@ -150,10 +168,18 @@ class EconomyDB:
                     job_shifts INTEGER DEFAULT 0,
                     last_worked REAL DEFAULT 0,
                     loan_amount TEXT DEFAULT '0',
-                    loan_due REAL DEFAULT 0
+                    loan_due REAL DEFAULT 0,
+                    fish_level INTEGER DEFAULT 1,
+                    fish_xp INTEGER DEFAULT 0
                 )
                 """
             )
+            for col, col_type in [("fish_level", "INTEGER DEFAULT 1"), ("fish_xp", "INTEGER DEFAULT 0")]:
+                try:
+                    await db.execute(f"ALTER TABLE economy_users ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS economy_transactions (
@@ -175,11 +201,52 @@ class EconomyDB:
                 """
             )
             await db.execute(
-                "INSERT OR IGNORE INTO economy_state (key, value) VALUES ('treasury', 500000000.0)"
+                """
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE COLLATE NOCASE,
+                    emoji TEXT DEFAULT '📦',
+                    buy_price TEXT DEFAULT '0',
+                    sell_price TEXT DEFAULT '0',
+                    can_buy INTEGER DEFAULT 1
+                )
+                """
             )
             await db.execute(
-                "INSERT OR IGNORE INTO economy_state (key, value) VALUES ('multiplier', 0.28)"
+                """
+                CREATE TABLE IF NOT EXISTS user_inventory (
+                    user_id INTEGER,
+                    item_name TEXT COLLATE NOCASE,
+                    quantity INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, item_name)
+                )
+                """
             )
+
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('treasury', 537740000000000000000.0)")
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('multiplier', 0.28)")
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('fee_rate', 0.0114)")
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('passive_rate', 0.0043)")
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('global_wins', 24934.0)")
+            await db.execute("INSERT OR IGNORE INTO economy_state (key, value) VALUES ('global_losses', 79976.0)")
+
+            default_items = [
+                ("Lucky Worm Bait", "🪱", "2500", "1250", 1),
+                ("Fiberglass Fishing Rod", "🎣", "25000", "12500", 1),
+                ("Shiny Pearl", "🦪", "0", "15000", 0),
+                ("Sunken Treasure Chest", "🪙", "0", "150000", 0),
+                ("Ancient Relic", "🏺", "0", "500000", 0),
+                ("Old Boot", "👢", "0", "50", 0),
+            ]
+            for name, emoji, buy_p, sell_p, can_b in default_items:
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO shop_items (name, emoji, buy_price, sell_price, can_buy)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, emoji, buy_p, sell_p, can_b),
+                )
+
             await db.commit()
 
     @staticmethod
@@ -190,9 +257,11 @@ class EconomyDB:
                 row = await cur.fetchone()
                 if row:
                     data = dict(row)
-                    data["wallet"] = int(str(data.get("wallet") or "0"))
-                    data["bank"] = int(str(data.get("bank") or "0"))
-                    data["loan_amount"] = int(str(data.get("loan_amount") or "0"))
+                    data["wallet"] = safe_to_int(data.get("wallet"))
+                    data["bank"] = safe_to_int(data.get("bank"))
+                    data["loan_amount"] = safe_to_int(data.get("loan_amount"))
+                    data["fish_level"] = max(1, min(10, data.get("fish_level") or 1))
+                    data["fish_xp"] = data.get("fish_xp") or 0
                     return data
 
             await db.execute("INSERT OR IGNORE INTO economy_users (user_id) VALUES (?)", (user_id,))
@@ -200,9 +269,11 @@ class EconomyDB:
             async with db.execute("SELECT * FROM economy_users WHERE user_id = ?", (user_id,)) as cur:
                 row = await cur.fetchone()
                 data = dict(row)
-                data["wallet"] = int(str(data.get("wallet") or "0"))
-                data["bank"] = int(str(data.get("bank") or "0"))
-                data["loan_amount"] = int(str(data.get("loan_amount") or "0"))
+                data["wallet"] = safe_to_int(data.get("wallet"))
+                data["bank"] = safe_to_int(data.get("bank"))
+                data["loan_amount"] = safe_to_int(data.get("loan_amount"))
+                data["fish_level"] = max(1, min(10, data.get("fish_level") or 1))
+                data["fish_xp"] = data.get("fish_xp") or 0
                 return data
 
     @staticmethod
@@ -240,6 +311,13 @@ class EconomyDB:
             await db.commit()
 
     @staticmethod
+    async def record_game(won: bool) -> None:
+        key = "global_wins" if won else "global_losses"
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE economy_state SET value = value + 1 WHERE key = ?", (key,))
+            await db.commit()
+
+    @staticmethod
     async def get_recent_transactions(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -256,7 +334,7 @@ class EconomyDB:
                 results = []
                 for r in rows:
                     item = dict(r)
-                    item["amount"] = int(str(item.get("amount") or "0"))
+                    item["amount"] = safe_to_int(item.get("amount"))
                     results.append(item)
                 return results
 
@@ -265,7 +343,7 @@ class EconomyDB:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT value FROM economy_state WHERE key = 'treasury'") as cur:
                 tr_row = await cur.fetchone()
-                treasury = tr_row[0] if tr_row else 500000000.0
+                treasury = tr_row[0] if tr_row else 537740000000000000000.0
             async with db.execute("SELECT value FROM economy_state WHERE key = 'multiplier'") as cur:
                 mp_row = await cur.fetchone()
                 multiplier = mp_row[0] if mp_row else 0.28
@@ -279,3 +357,213 @@ class EconomyDB:
                 (delta,),
             )
             await db.commit()
+
+    @staticmethod
+    async def get_overview_data(user_id: int) -> dict[str, Any]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            async with db.execute("SELECT wallet, bank FROM economy_users") as cur:
+                rows = await cur.fetchall()
+
+            total_wallet = sum(safe_to_int(r["wallet"]) for r in rows)
+            total_bank = sum(safe_to_int(r["bank"]) for r in rows)
+            circulating = total_wallet + total_bank
+
+            async with db.execute("SELECT key, value FROM economy_state") as cur:
+                state_rows = await cur.fetchall()
+                state = {r["key"]: r["value"] for r in state_rows}
+
+            treasury = safe_to_int(state.get("treasury", 537740000000000000000))
+            total_supply = circulating + treasury
+
+            user = await EconomyDB.get_user(user_id)
+            user_net = user["wallet"] + user["bank"]
+
+            portfolio_pct = 0.0
+            if total_supply > 0:
+                portfolio_pct = float((Decimal(user_net) / Decimal(total_supply)) * Decimal(100))
+
+            day_ago = time.time() - 86400
+            async with db.execute(
+                "SELECT amount FROM economy_transactions WHERE created_at >= ?",
+                (day_ago,),
+            ) as cur:
+                tx_rows = await cur.fetchall()
+                volume_24h = sum(safe_to_int(r["amount"]) for r in tx_rows)
+
+            wins = int(state.get("global_wins", 24934))
+            losses = int(state.get("global_losses", 79976))
+            total_games = wins + losses
+            win_rate = (wins / total_games * 100) if total_games > 0 else 50.0
+
+            return {
+                "total_supply": total_supply,
+                "circulating": circulating,
+                "treasury": treasury,
+                "fee_rate": state.get("fee_rate", 0.0114),
+                "passive_rate": state.get("passive_rate", 0.0043),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "user_net": user_net,
+                "portfolio_pct": portfolio_pct,
+                "volume_24h": volume_24h,
+            }
+
+    @staticmethod
+    async def get_fishing_stats(user_id: int) -> tuple[int, int]:
+        user = await EconomyDB.get_user(user_id)
+        level = max(1, min(10, user.get("fish_level") or 1))
+        xp = user.get("fish_xp") or 0
+        return level, xp
+
+    @staticmethod
+    async def add_fishing_progress(user_id: int, xp_gain: int) -> tuple[int, bool]:
+        level, current_xp = await EconomyDB.get_fishing_stats(user_id)
+        new_xp = current_xp + xp_gain
+        leveled_up = False
+
+        xp_needed = level * 300
+        if new_xp >= xp_needed and level < 10:
+            level += 1
+            new_xp = 0
+            leveled_up = True
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE economy_users SET fish_level = ?, fish_xp = ? WHERE user_id = ?",
+                (level, new_xp, user_id),
+            )
+            await db.commit()
+
+        return level, leveled_up
+
+    # ==========================================
+    # SHOP & INVENTORY OPERATIONS
+    # ==========================================
+
+    @staticmethod
+    async def add_shop_item(name: str, emoji: str, buy_price: int, sell_price: int | None = None, can_buy: int = 1) -> None:
+        sell_p = sell_price if sell_price is not None else int(buy_price * 0.70)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO shop_items (name, emoji, buy_price, sell_price, can_buy)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    emoji = excluded.emoji,
+                    buy_price = excluded.buy_price,
+                    sell_price = excluded.sell_price,
+                    can_buy = excluded.can_buy
+                """,
+                (name.strip(), emoji.strip(), str(buy_price), str(sell_p), can_buy),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def remove_shop_item(name: str) -> bool:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("DELETE FROM shop_items WHERE LOWER(name) = LOWER(?)", (name.strip(),))
+            await db.commit()
+            return cur.rowcount > 0
+
+    @staticmethod
+    async def get_shop_item(name: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM shop_items WHERE LOWER(name) = LOWER(?)", (name.strip(),)) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                data = dict(row)
+                data["buy_price"] = safe_to_int(data.get("buy_price"))
+                data["sell_price"] = safe_to_int(data.get("sell_price"))
+                return data
+
+    @staticmethod
+    async def get_all_shop_items() -> list[dict[str, Any]]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM shop_items ORDER BY id ASC") as cur:
+                rows = await cur.fetchall()
+                results = []
+                for r in rows:
+                    data = dict(r)
+                    data["buy_price"] = safe_to_int(data.get("buy_price"))
+                    data["sell_price"] = safe_to_int(data.get("sell_price"))
+                    results.append(data)
+                return results
+
+    @staticmethod
+    async def add_user_inventory(user_id: int, item_name: str, quantity: int = 1, default_emoji: str = "🐟", default_sell_price: int = 0) -> None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Ensure item entry exists in shop_items registry for display & sale
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO shop_items (name, emoji, buy_price, sell_price, can_buy)
+                VALUES (?, ?, '0', ?, 0)
+                """,
+                (item_name.strip(), default_emoji, str(default_sell_price)),
+            )
+            await db.execute(
+                """
+                INSERT INTO user_inventory (user_id, item_name, quantity)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, item_name) DO UPDATE SET
+                    quantity = quantity + excluded.quantity
+                """,
+                (user_id, item_name.strip(), quantity),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def remove_user_inventory(user_id: int, item_name: str, quantity: int = 1) -> bool:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT quantity FROM user_inventory WHERE user_id = ? AND LOWER(item_name) = LOWER(?)",
+                (user_id, item_name.strip()),
+            ) as cur:
+                row = await cur.fetchone()
+                if not row or row["quantity"] < quantity:
+                    return False
+
+            new_qty = row["quantity"] - quantity
+            if new_qty <= 0:
+                await db.execute(
+                    "DELETE FROM user_inventory WHERE user_id = ? AND LOWER(item_name) = LOWER(?)",
+                    (user_id, item_name.strip()),
+                )
+            else:
+                await db.execute(
+                    "UPDATE user_inventory SET quantity = ? WHERE user_id = ? AND LOWER(item_name) = LOWER(?)",
+                    (new_qty, user_id, item_name.strip()),
+                )
+            await db.commit()
+            return True
+
+    @staticmethod
+    async def get_user_inventory(user_id: int) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT ui.item_name, ui.quantity, si.emoji, si.buy_price, si.sell_price
+                FROM user_inventory ui
+                LEFT JOIN shop_items si ON LOWER(ui.item_name) = LOWER(si.name)
+                WHERE ui.user_id = ? AND ui.quantity > 0
+                ORDER BY ui.quantity DESC
+                """,
+                (user_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+                results = []
+                for r in rows:
+                    data = dict(r)
+                    data["buy_price"] = safe_to_int(data.get("buy_price"))
+                    data["sell_price"] = safe_to_int(data.get("sell_price"))
+                    if not data.get("emoji"):
+                        data["emoji"] = "🐟"
+                    results.append(data)
+                return results

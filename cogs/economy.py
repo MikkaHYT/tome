@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from decimal import Decimal
 from typing import Optional
 
 import aiosqlite
@@ -19,6 +20,7 @@ from utils.economy_db import (
     format_cash,
     format_cash_short,
     parse_bet,
+    safe_to_int,
 )
 
 
@@ -410,7 +412,149 @@ class Economy(commands.Cog):
         await self.job_work(ctx)
 
     # ==========================================
-    # LEADERBOARD (UNBOUNDED BIGINT SORTING)
+    # SHOP & INVENTORY
+    # ==========================================
+
+    @commands.command(name="shop", aliases=["store"])
+    async def shop_cmd(self, ctx: commands.Context):
+        items = await EconomyDB.get_all_shop_items()
+        buyable = [i for i in items if i["can_buy"] == 1]
+
+        lines = []
+        for it in buyable:
+            lines.append(
+                f"• {it['emoji']} **{it['name']}**\n"
+                f"  Price: {format_cash(it['buy_price'])} · Resell: {format_cash_short(it['sell_price'])}"
+            )
+
+        view = discord.ui.LayoutView(timeout=180)
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+        container.add_item(
+            text_display(
+                f"# 🏪 Server Marketplace\n\n"
+                f"Purchase items with `{ctx.prefix}buy <name> [quantity]`\n"
+                f"Sell items from inventory with `{ctx.prefix}sell <name> [quantity]`\n\n"
+                + ("\n\n".join(lines) if lines else "*No items currently stocked in the store.*")
+            )
+        )
+        view.add_item(container)
+        await ctx.send(view=view)
+
+    @commands.command(name="buy")
+    async def buy_cmd(self, ctx: commands.Context, *, args: str):
+        parts = args.rsplit(" ", 1)
+        item_query = args
+        qty = 1
+
+        if len(parts) == 2 and parts[1].isdigit():
+            item_query = parts[0]
+            qty = max(1, int(parts[1]))
+
+        item = await EconomyDB.get_shop_item(item_query)
+        if not item or item["can_buy"] != 1:
+            return await ctx.send(view=simple_view(f"❌ Item **{item_query}** is not available for purchase."))
+
+        total_cost = item["buy_price"] * qty
+        data = await EconomyDB.get_user(ctx.author.id)
+        if data["wallet"] < total_cost:
+            return await ctx.send(
+                view=simple_view(
+                    f"❌ You need {format_cash(total_cost)} to buy {qty}x **{item['name']}** (You have {format_cash_short(data['wallet'])})."
+                )
+            )
+
+        await EconomyDB.update_balance(
+            ctx.author.id,
+            wallet=-total_cost,
+            description=f"Purchased {qty}x {item['name']}",
+        )
+        await EconomyDB.add_user_inventory(
+            ctx.author.id,
+            item_name=item["name"],
+            quantity=qty,
+            default_emoji=item["emoji"],
+            default_sell_price=item["sell_price"],
+        )
+
+        await ctx.send(
+            view=simple_view(
+                f"🛍️ Successfully purchased **{qty}x {item['emoji']} {item['name']}** for {format_cash(total_cost)}!"
+            )
+        )
+
+    @commands.command(name="sell")
+    async def sell_cmd(self, ctx: commands.Context, *, args: str):
+        parts = args.rsplit(" ", 1)
+        item_query = args
+        sell_all = False
+        qty = 1
+
+        if len(parts) == 2:
+            if parts[1].lower() in ("all", "max"):
+                item_query = parts[0]
+                sell_all = True
+            elif parts[1].isdigit():
+                item_query = parts[0]
+                qty = max(1, int(parts[1]))
+
+        inv = await EconomyDB.get_user_inventory(ctx.author.id)
+        user_item = next((i for i in inv if i["item_name"].lower() == item_query.lower()), None)
+        if not user_item:
+            return await ctx.send(view=simple_view(f"❌ You don't have any **{item_query}** in your inventory."))
+
+        if sell_all:
+            qty = user_item["quantity"]
+
+        if user_item["quantity"] < qty:
+            return await ctx.send(
+                view=simple_view(f"❌ You only have **{user_item['quantity']}x** of that item.")
+            )
+
+        sell_rate = user_item.get("sell_price") or 50
+        payout = sell_rate * qty
+
+        removed = await EconomyDB.remove_user_inventory(ctx.author.id, user_item["item_name"], quantity=qty)
+        if not removed:
+            return await ctx.send(view=simple_view("❌ Failed to process sale."))
+
+        await EconomyDB.update_balance(
+            ctx.author.id,
+            wallet=payout,
+            description=f"Sold {qty}x {user_item['item_name']}",
+        )
+
+        await ctx.send(
+            view=simple_view(
+                f"💰 Sold **{qty}x {user_item['emoji']} {user_item['item_name']}** for {format_cash(payout)}!"
+            )
+        )
+
+    @commands.command(name="inventory", aliases=["inv"])
+    async def inventory_cmd(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        user = member or ctx.author
+        inv = await EconomyDB.get_user_inventory(user.id)
+
+        lines = []
+        total_inv_value = 0
+        for it in inv:
+            val = it["sell_price"] * it["quantity"]
+            total_inv_value += val
+            lines.append(f"• {it['emoji']} **{it['item_name']}** ×`{it['quantity']:,}` · Val: {format_cash_short(val)}")
+
+        view = discord.ui.LayoutView(timeout=180)
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+        container.add_item(
+            text_display(
+                f"### **🎒 {user.display_name}'s Inventory**\n\n"
+                + ("\n".join(lines) if lines else "*Your backpack is completely empty. Go fishing or visit the shop!*")
+                + f"\n\n-# Total Resale Value: {format_cash_short(total_inv_value)}"
+            )
+        )
+        view.add_item(container)
+        await ctx.send(view=view)
+
+    # ==========================================
+    # LEADERBOARD
     # ==========================================
 
     @commands.command(name="leaderboard", aliases=["lb", "rich"])
@@ -422,8 +566,8 @@ class Economy(commands.Cog):
 
         all_users = []
         for r in rows:
-            w = int(str(r["wallet"] or "0"))
-            b = int(str(r["bank"] or "0"))
+            w = safe_to_int(r["wallet"])
+            b = safe_to_int(r["bank"])
             all_users.append((r["user_id"], w + b))
 
         all_users.sort(key=lambda x: x[1], reverse=True)
@@ -448,37 +592,93 @@ class Economy(commands.Cog):
         await ctx.send(view=view)
 
     # ==========================================
-    # REWORKED ECONOMY METRICS
+    # REWORKED ECONOMY OVERVIEW & HEALTH
     # ==========================================
 
-    @commands.command(name="economy", aliases=["econ", "health", "treasury"])
-    async def economy_cmd(self, ctx: commands.Context):
-        treasury, mult = await EconomyDB.get_econ_state()
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT wallet, bank FROM economy_users") as cur:
-                rows = await cur.fetchall()
-
-        total_wallet = sum(int(str(r[0] or "0")) for r in rows)
-        total_bank = sum(int(str(r[1] or "0")) for r in rows)
-        circulating = total_wallet + total_bank
+    @commands.group(name="economy", aliases=["econ"], invoke_without_command=True)
+    async def economy_group(self, ctx: commands.Context):
+        data = await EconomyDB.get_overview_data(ctx.author.id)
 
         view = discord.ui.LayoutView(timeout=180)
         container = discord.ui.Container(accent_color=EMBED_COLOR)
-        container.add_item(
-            text_display(
-                f"### **🏛️ Central Economy & Reserve Health**\n\n"
-                f"• **National Treasury Reserve:** {format_cash(treasury)}\n"
-                f"• **Global Reward Multiplier:** ×{mult:.3f}\n"
-                f"• **Circulating Supply:** {format_cash(circulating)}\n"
-                f"• **Total Bank Deposits:** {format_cash(total_bank)}\n"
-                f"• **Total Wallet Cash:** {format_cash(total_wallet)}\n"
-                f"• **Active Citizen Accounts:** {len(rows):,}\n"
-                f"• **Federal Reserve Status:** 100% Unbounded Solvency"
-            )
+
+        content = (
+            f"📊 **Economy Overview**\n\n"
+            f"Current state of the server economy\n\n"
+            f"💵 **Supply**\n"
+            f"**Total:** {format_cash(data['total_supply'])}\n"
+            f"**Circulating:** {format_cash(data['circulating'])}\n\n"
+            f"🏦 **Treasury**\n"
+            f"{format_cash(data['treasury'])}\n\n"
+            f"⚙️ **Rates**\n"
+            f"**Fee:** {data['fee_rate'] * 100:.2f}%\n"
+            f"**Passive Income:** {data['passive_rate'] * 100:.2f}%\n\n"
+            f"🎲 **Global Stats**\n"
+            f"**Wins:** {data['wins']:,}\n"
+            f"**Losses:** {data['losses']:,}\n"
+            f"**Win Rate:** {data['win_rate']:.1f}%\n\n"
+            f"💼 **Your Portfolio**\n"
+            f"{data['portfolio_pct']:.4f}% of total supply\n"
+            f"({format_cash(data['user_net'])})\n\n"
+            f"-# 💡 Use {ctx.prefix}economy health for detailed analysis • {ctx.prefix}economy trends for historical data"
         )
+
+        container.add_item(text_display(content))
         view.add_item(container)
         await ctx.send(view=view)
+
+    @economy_group.command(name="health")
+    async def economy_health(self, ctx: commands.Context):
+        data = await EconomyDB.get_overview_data(ctx.author.id)
+
+        total_supply = Decimal(data["total_supply"]) if data["total_supply"] > 0 else Decimal(1)
+        treasury = Decimal(data["treasury"])
+        circulating = Decimal(data["circulating"])
+        volume = Decimal(data["volume_24h"])
+
+        treasury_ratio = float((treasury / total_supply) * Decimal(100))
+        treasury_score = min(37.5, (treasury_ratio / 25.0) * 37.5) if treasury_ratio <= 25.0 else max(5.0, 37.5 - ((treasury_ratio - 25.0) * 0.8))
+        treasury_dot = "🟢" if treasury_ratio >= 20.0 else ("🟡" if treasury_ratio >= 15.0 else "🔴")
+
+        liquidity_ratio = float((circulating / total_supply) * Decimal(100))
+        liquidity_score = min(31.25, (liquidity_ratio / 85.0) * 31.25)
+        liquidity_dot = "🟢" if liquidity_ratio >= 75.0 else "🟡"
+
+        velocity_ratio = float((volume / circulating * Decimal(100))) if circulating > 0 else 0.1231
+        velocity_score = min(31.25, max(10.0, 31.25 - (velocity_ratio * 2.0)))
+        velocity_dot = "🟢" if velocity_ratio < 1.0 else "🟡"
+
+        overall_score = treasury_score + liquidity_score + velocity_score
+        grade = "Excellent" if overall_score >= 80 else ("Good" if overall_score >= 60 else ("Fair" if overall_score >= 40 else "Poor"))
+
+        view = discord.ui.LayoutView(timeout=180)
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+
+        content = (
+            f"🏥 **Economic Health Score**\n\n"
+            f"Overall Score: **{overall_score:.1f}/100** ({grade})\n\n"
+            f"{treasury_dot} **Treasury Health**\n"
+            f"Value: {treasury_ratio:.2f}%\n"
+            f"Score: {treasury_score:.2f}/37.5\n\n"
+            f"{liquidity_dot} **Liquidity Ratio**\n"
+            f"Value: {liquidity_ratio:.2f}%\n"
+            f"Score: {liquidity_score:.2f}/31.25\n\n"
+            f"{velocity_dot} **Velocity Of Money**\n"
+            f"Value: {velocity_ratio:.4f}%\n"
+            f"Score: {velocity_score:.2f}/31.25\n\n"
+            f"💡 **Info**\n"
+            f"🟡 Very high liquidity. Consider investments or large transactions.\n"
+            f"🟡 Low economic activity. Transaction volumes are below normal.\n\n"
+            f"-# Higher scores indicate better economic health"
+        )
+
+        container.add_item(text_display(content))
+        view.add_item(container)
+        await ctx.send(view=view)
+
+    @commands.command(name="health", aliases=["econhealth"])
+    async def health_shortcut(self, ctx: commands.Context):
+        await self.economy_health(ctx)
 
     # ==========================================
     # ROBBING & DROPS
@@ -533,10 +733,35 @@ class Economy(commands.Cog):
                 f"• `{ctx.prefix}admin givemoney <@user> <amount>`\n"
                 f"• `{ctx.prefix}admin takemoney <@user> <amount>`\n"
                 f"• `{ctx.prefix}admin setmoney <@user> <amount>`\n"
+                f"• `{ctx.prefix}admin additem <name> <emoji> <value>`\n"
+                f"• `{ctx.prefix}admin removeitem <name>`\n"
                 f"• `{ctx.prefix}admin reset <@user>`\n"
                 f"• `{ctx.prefix}admin setmultiplier <val>`"
             )
         )
+
+    @admin_group.command(name="additem")
+    async def admin_additem(self, ctx: commands.Context, name: str, emoji: str, value: str):
+        if not await self.bot.is_owner(ctx.author):
+            return
+        val = parse_bet(value, 10**303)
+        if not val or val <= 0:
+            return await ctx.send("❌ Enter a valid value or price.")
+
+        await EconomyDB.add_shop_item(name=name, emoji=emoji, buy_price=val)
+        await ctx.send(
+            f"✅ Registered item **{emoji} {name}** into the marketplace at {format_cash(val)} (Sell: {format_cash_short(int(val * 0.70))})."
+        )
+
+    @admin_group.command(name="removeitem")
+    async def admin_removeitem(self, ctx: commands.Context, *, name: str):
+        if not await self.bot.is_owner(ctx.author):
+            return
+        deleted = await EconomyDB.remove_shop_item(name)
+        if deleted:
+            await ctx.send(f"✅ Removed **{name}** from the marketplace registry.")
+        else:
+            await ctx.send(f"❌ Item **{name}** was not found in the shop database.")
 
     @admin_group.command(name="givemoney")
     async def admin_givemoney(self, ctx: commands.Context, member: discord.Member, *, amount: str):
@@ -579,8 +804,9 @@ class Economy(commands.Cog):
             return
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE economy_users SET wallet = '1000', bank = '0' WHERE user_id = ?", (member.id,))
+            await db.execute("DELETE FROM user_inventory WHERE user_id = ?", (member.id,))
             await db.commit()
-        await ctx.send(f"✅ Reset economy data for {member.mention}.")
+        await ctx.send(f"✅ Reset economy data and backpack for {member.mention}.")
 
     @admin_group.command(name="setmultiplier")
     async def admin_setmultiplier(self, ctx: commands.Context, value: float):
