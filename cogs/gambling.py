@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 
 from config import EMBED_COLOR
-from utils.economy_db import EconomyDB, format_cash, parse_bet
+from utils.economy_db import EconomyDB, format_cash, format_cash_short, parse_bet
 
 
 def text_display(content: str) -> discord.ui.TextDisplay:
@@ -31,6 +31,153 @@ def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
 
 
 # ============================================================
+# LIVE-EDIT MINES (MATCHING image_7.png)
+# ============================================================
+
+class MinesView(discord.ui.LayoutView):
+    def __init__(self, author_id: int, bet: int, bomb_count: int):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.bet = bet
+        self.bomb_count = bomb_count
+        self.revealed: set[int] = set()
+        self.bombs: set[int] = set(random.sample(range(25), bomb_count))
+        self.game_over = False
+        self.won = False
+        self.exploded_idx: int | None = None
+
+        self._render()
+
+    def current_multiplier(self) -> float:
+        safe_hits = len(self.revealed)
+        if safe_hits == 0:
+            return 1.0
+        # Authentic 97% RTP curve
+        mult = 0.97 * (math.comb(25, safe_hits) / math.comb(25 - self.bomb_count, safe_hits))
+        return round(mult, 2)
+
+    def _render(self, busted: bool = False, cashed_out: bool = False):
+        self.clear_items()
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+
+        rem_gems = (25 - self.bomb_count) - len(self.revealed)
+        mult = self.current_multiplier()
+        potential_win = int(self.bet * mult)
+
+        if busted:
+            header = (
+                f"# 💥 BOOM! Game Over\n\n"
+                f"You lost **{format_cash_short(self.bet)}** 🪙\n\n"
+                f"💎 **Remaining Gems:** {rem_gems}\n"
+                f"📈 **Multiplier:** x{mult:.2f}\n"
+                f"💰 **Potential Win:** 🪙 {format_cash_short(potential_win)}"
+            )
+        elif cashed_out:
+            header = (
+                f"# 💰 Cashout Successful!\n\n"
+                f"You won **{format_cash(potential_win)}** (x{mult:.2f})!\n\n"
+                f"💎 **Gems Cleared:** {len(self.revealed)}\n"
+                f"💣 **Bombs Avoided:** {self.bomb_count}"
+            )
+        else:
+            header = (
+                f"# 💎 Mines\n\n"
+                f"Avoid the **{self.bomb_count}** bombs to win!\n\n"
+                f"💎 **Remaining Gems:** {rem_gems}\n"
+                f"📈 **Multiplier:** x{mult:.2f}\n"
+                f"💰 **Potential Win:** 🪙 {format_cash_short(potential_win)}"
+            )
+
+        container.add_item(text_display(header))
+        container.add_item(small_separator())
+
+        # Render 5x5 Grid Buttons
+        for row in range(5):
+            btn_row = []
+            for col in range(5):
+                idx = row * 5 + col
+                btn_row.append(MineTileButton(self, idx))
+            container.add_item(discord.ui.ActionRow(*btn_row))
+
+        if not self.game_over and len(self.revealed) > 0:
+            container.add_item(small_separator())
+            container.add_item(discord.ui.ActionRow(MinesCashoutButton(self)))
+
+        self.add_item(container)
+
+
+class MineTileButton(discord.ui.Button):
+    def __init__(self, mines_view: MinesView, idx: int):
+        self.mines_view = mines_view
+        self.idx = idx
+
+        if idx in mines_view.revealed:
+            label = "🟢"
+            style = discord.ButtonStyle.success
+            disabled = True
+        elif mines_view.game_over:
+            if idx in mines_view.bombs:
+                label = "🔴" if idx == mines_view.exploded_idx else "💣"
+                style = discord.ButtonStyle.danger
+            else:
+                label = "🟢"
+                style = discord.ButtonStyle.secondary
+            disabled = True
+        else:
+            label = "\u200b"
+            style = discord.ButtonStyle.secondary
+            disabled = False
+
+        super().__init__(label=label, style=style, disabled=disabled, row=idx // 5)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.mines_view.author_id:
+            return await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+
+        if self.idx in self.mines_view.bombs:
+            self.mines_view.game_over = True
+            self.mines_view.exploded_idx = self.idx
+            await EconomyDB.modify_treasury(self.mines_view.bet)
+            self.mines_view._render(busted=True)
+        else:
+            self.mines_view.revealed.add(self.idx)
+            if len(self.mines_view.revealed) == (25 - self.mines_view.bomb_count):
+                self.mines_view.game_over = True
+                winnings = int(self.mines_view.bet * self.mines_view.current_multiplier())
+                await EconomyDB.update_balance(
+                    self.mines_view.author_id,
+                    wallet=winnings,
+                    description="Mines Full Sweep Win",
+                )
+                self.mines_view._render(cashed_out=True)
+            else:
+                self.mines_view._render()
+
+        await interaction.response.edit_message(view=self.mines_view)
+
+
+class MinesCashoutButton(discord.ui.Button):
+    def __init__(self, mines_view: MinesView):
+        super().__init__(label="💰 Cashout", style=discord.ButtonStyle.success)
+        self.mines_view = mines_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.mines_view.author_id:
+            return await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+
+        self.mines_view.game_over = True
+        winnings = int(self.mines_view.bet * self.mines_view.current_multiplier())
+        await EconomyDB.update_balance(
+            self.mines_view.author_id,
+            wallet=winnings,
+            description="Mines game cashout",
+        )
+        await EconomyDB.modify_treasury(self.mines_view.bet - winnings)
+        self.mines_view._render(cashed_out=True)
+        await interaction.response.edit_message(view=self.mines_view)
+
+
+# ============================================================
 # BLACKJACK SYSTEM
 # ============================================================
 
@@ -42,9 +189,7 @@ SUITS = ["❤️", "♣️", "♦️", "♠️"]
 
 
 def draw_card() -> tuple[str, str]:
-    rank = random.choice(list(CARD_VALUES.keys()))
-    suit = random.choice(SUITS)
-    return rank, suit
+    return random.choice(list(CARD_VALUES.keys())), random.choice(SUITS)
 
 
 def hand_score(hand: list[tuple[str, str]]) -> int:
@@ -64,7 +209,6 @@ class BlackjackView(discord.ui.LayoutView):
         self.player_hand = [draw_card(), draw_card()]
         self.dealer_hand = [draw_card(), draw_card()]
         self.game_over = False
-
         self._render()
 
     def _render(self, result_msg: str | None = None):
@@ -94,15 +238,15 @@ class BlackjackView(discord.ui.LayoutView):
             )
 
         container.add_item(text_display(header))
-
         if not self.game_over:
             container.add_item(small_separator())
-            row = discord.ui.ActionRow(
-                BlackjackHit(self),
-                BlackjackStay(self),
-                BlackjackDouble(self),
+            container.add_item(
+                discord.ui.ActionRow(
+                    BlackjackHit(self),
+                    BlackjackStay(self),
+                    BlackjackDouble(self),
+                )
             )
-            container.add_item(row)
 
         self.add_item(container)
 
@@ -114,7 +258,7 @@ class BlackjackHit(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.bj_view.author_id:
-            return await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return await interaction.response.send_message("❌ Not your game.", ephemeral=True)
 
         self.bj_view.player_hand.append(draw_card())
         if hand_score(self.bj_view.player_hand) > 21:
@@ -133,7 +277,7 @@ class BlackjackStay(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.bj_view.author_id:
-            return await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return await interaction.response.send_message("❌ Not your game.", ephemeral=True)
 
         self.bj_view.game_over = True
         while hand_score(self.bj_view.dealer_hand) < 17:
@@ -144,11 +288,11 @@ class BlackjackStay(discord.ui.Button):
 
         if d_score > 21 or p_score > d_score:
             winnings = self.bj_view.bet * 2
-            await EconomyDB.update_balance(self.bj_view.author_id, wallet=winnings)
+            await EconomyDB.update_balance(self.bj_view.author_id, wallet=winnings, description="Blackjack Win")
             await EconomyDB.modify_treasury(-self.bj_view.bet)
             self.bj_view._render(f"🎉 You won **{format_cash(winnings)}**!")
         elif p_score == d_score:
-            await EconomyDB.update_balance(self.bj_view.author_id, wallet=self.bj_view.bet)
+            await EconomyDB.update_balance(self.bj_view.author_id, wallet=self.bj_view.bet, description="Blackjack Push")
             self.bj_view._render("🤝 Push! Your bet was returned.")
         else:
             await EconomyDB.modify_treasury(self.bj_view.bet)
@@ -164,13 +308,13 @@ class BlackjackDouble(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.bj_view.author_id:
-            return await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return await interaction.response.send_message("❌ Not your game.", ephemeral=True)
 
         user_data = await EconomyDB.get_user(self.bj_view.author_id)
         if user_data["wallet"] < self.bj_view.bet:
-            return await interaction.response.send_message("❌ You don't have enough funds to double down.", ephemeral=True)
+            return await interaction.response.send_message("❌ Insufficient funds to double down.", ephemeral=True)
 
-        await EconomyDB.update_balance(self.bj_view.author_id, wallet=-self.bj_view.bet)
+        await EconomyDB.update_balance(self.bj_view.author_id, wallet=-self.bj_view.bet, description="Blackjack Double Down")
         self.bj_view.bet *= 2
         self.bj_view.player_hand.append(draw_card())
 
@@ -186,138 +330,17 @@ class BlackjackDouble(discord.ui.Button):
 
             if d_score > 21 or p_score > d_score:
                 winnings = self.bj_view.bet * 2
-                await EconomyDB.update_balance(self.bj_view.author_id, wallet=winnings)
+                await EconomyDB.update_balance(self.bj_view.author_id, wallet=winnings, description="Blackjack Double Win")
                 await EconomyDB.modify_treasury(-self.bj_view.bet)
                 self.bj_view._render(f"🎉 Double down win! Paid **{format_cash(winnings)}**!")
             elif p_score == d_score:
-                await EconomyDB.update_balance(self.bj_view.author_id, wallet=self.bj_view.bet)
-                self.bj_view._render("🤝 Push! Your doubled bet was returned.")
+                await EconomyDB.update_balance(self.bj_view.author_id, wallet=self.bj_view.bet, description="Blackjack Push")
+                self.bj_view._render("🤝 Push! Doubled bet was returned.")
             else:
                 await EconomyDB.modify_treasury(self.bj_view.bet)
                 self.bj_view._render("💀 Dealer wins! You lose.")
 
         await interaction.response.edit_message(view=self.bj_view)
-
-
-# ============================================================
-# MINES SYSTEM
-# ============================================================
-
-class MinesView(discord.ui.LayoutView):
-    def __init__(self, author_id: int, bet: int, bomb_count: int):
-        super().__init__(timeout=180)
-        self.author_id = author_id
-        self.bet = bet
-        self.bomb_count = bomb_count
-        self.revealed = set()
-        self.bombs = set(random.sample(range(25), bomb_count))
-        self.game_over = False
-
-        self._render()
-
-    def current_multiplier(self) -> float:
-        safe_hits = len(self.revealed)
-        if safe_hits == 0:
-            return 1.0
-        # Fair house edge formula
-        mult = 0.98 * (math.comb(25, safe_hits) / math.comb(25 - self.bomb_count, safe_hits))
-        return round(mult, 2)
-
-    def _render(self, result_msg: str | None = None):
-        self.clear_items()
-        container = discord.ui.Container(accent_color=EMBED_COLOR)
-
-        rem_gems = (25 - self.bomb_count) - len(self.revealed)
-        mult = self.current_multiplier()
-
-        header = (
-            f"### **💎 Mines**\n\n"
-            f"Avoid the **{self.bomb_count}** bombs to win!\n\n"
-            f"💎 **Remaining Gems:** {rem_gems}\n"
-            f"📈 **Multiplier:** x{mult}\n"
-            f"💰 **Bet:** {format_cash(self.bet)}"
-        )
-        if result_msg:
-            header += f"\n\n**Outcome:** {result_msg}"
-
-        container.add_item(text_display(header))
-        container.add_item(small_separator())
-
-        # Render 5x5 grid
-        for row in range(5):
-            btn_row = []
-            for col in range(5):
-                idx = row * 5 + col
-                btn_row.append(MineTileButton(self, idx))
-            container.add_item(discord.ui.ActionRow(*btn_row))
-
-        if not self.game_over and len(self.revealed) > 0:
-            container.add_item(small_separator())
-            container.add_item(discord.ui.ActionRow(MinesCashoutButton(self)))
-
-        self.add_item(container)
-
-
-class MineTileButton(discord.ui.Button):
-    def __init__(self, mines_view: MinesView, idx: int):
-        self.mines_view = mines_view
-        self.idx = idx
-
-        if idx in mines_view.revealed:
-            label = "💎"
-            style = discord.ButtonStyle.success
-            disabled = True
-        elif mines_view.game_over:
-            if idx in mines_view.bombs:
-                label = "💣"
-                style = discord.ButtonStyle.danger
-            else:
-                label = "💎"
-                style = discord.ButtonStyle.secondary
-            disabled = True
-        else:
-            label = "\u200b"
-            style = discord.ButtonStyle.secondary
-            disabled = False
-
-        super().__init__(label=label, style=style, disabled=disabled, row=idx // 5)
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.mines_view.author_id:
-            return await interaction.response.send_message("❌ Not your game.", ephemeral=True)
-
-        if self.idx in self.mines_view.bombs:
-            self.mines_view.game_over = True
-            await EconomyDB.modify_treasury(self.mines_view.bet)
-            self.mines_view._render("💥 **BOOM!** You stepped on a bomb!")
-        else:
-            self.mines_view.revealed.add(self.idx)
-            if len(self.mines_view.revealed) == (25 - self.mines_view.bomb_count):
-                self.mines_view.game_over = True
-                winnings = int(self.mines_view.bet * self.mines_view.current_multiplier())
-                await EconomyDB.update_balance(self.mines_view.author_id, wallet=winnings)
-                self.mines_view._render(f"🏆 Clean sweep! Won **{format_cash(winnings)}**!")
-            else:
-                self.mines_view._render()
-
-        await interaction.response.edit_message(view=self.mines_view)
-
-
-class MinesCashoutButton(discord.ui.Button):
-    def __init__(self, mines_view: MinesView):
-        super().__init__(label="💰 Cashout", style=discord.ButtonStyle.success)
-        self.mines_view = mines_view
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.mines_view.author_id:
-            return await interaction.response.send_message("❌ Not your game.", ephemeral=True)
-
-        self.mines_view.game_over = True
-        winnings = int(self.mines_view.bet * self.mines_view.current_multiplier())
-        await EconomyDB.update_balance(self.mines_view.author_id, wallet=winnings)
-        await EconomyDB.modify_treasury(self.mines_view.bet - winnings)
-        self.mines_view._render(f"💰 Cashed out **{format_cash(winnings)}** (x{self.mines_view.current_multiplier()})!")
-        await interaction.response.edit_message(view=self.mines_view)
 
 
 # ============================================================
@@ -365,9 +388,8 @@ class CrashJoinModal(discord.ui.Modal, title="Enter Crash Bet"):
         if not amt or amt <= 0 or amt > user_data["wallet"]:
             return await interaction.response.send_message("❌ Invalid bet amount.", ephemeral=True)
 
-        await EconomyDB.update_balance(interaction.user.id, wallet=-amt)
+        await EconomyDB.update_balance(interaction.user.id, wallet=-amt, description="Crash Bet")
 
-        # Generate individual crash point using classic inverse formula (House edge ~4%)
         r = random.random()
         crash_point = round(max(1.05, 0.96 / (1.0 - r)), 2)
 
@@ -409,11 +431,11 @@ class CrashActiveView(discord.ui.LayoutView):
         player_status = []
         for uid, p in self.players.items():
             if p["cashed_out"]:
-                player_status.append(f"✅ **{p['name']}**: Cashed out at **x{p['cash_mult']:.2f}** (+{format_cash(p['winnings'])}) · Potential: x{p['crash_point']:.2f}")
+                player_status.append(f"✅ **{p['name']}**: Cashed out at **x{p['cash_mult']:.2f}** (+{format_cash_short(p['winnings'])}) · Potential: x{p['crash_point']:.2f}")
             elif self.current_mult >= p["crash_point"]:
-                player_status.append(f"💥 **{p['name']}**: Crashed at **x{p['crash_point']:.2f}**! (-{format_cash(p['bet'])})")
+                player_status.append(f"💥 **{p['name']}**: Crashed at **x{p['crash_point']:.2f}**! (-{format_cash_short(p['bet'])})")
             else:
-                player_status.append(f"🟢 **{p['name']}**: In Play ({format_cash(p['bet'])})")
+                player_status.append(f"🟢 **{p['name']}**: In Play ({format_cash_short(p['bet'])})")
 
         container.add_item(
             text_display(
@@ -440,14 +462,14 @@ class CrashCashoutButton(discord.ui.Button):
 
         p = self.active_view.players[uid]
         if p["cashed_out"]:
-            return await interaction.response.send_message("❌ You already cashed out!", ephemeral=True)
+            return await interaction.response.send_message("❌ Already cashed out!", ephemeral=True)
         if self.active_view.current_mult >= p["crash_point"]:
             return await interaction.response.send_message("❌ You already crashed!", ephemeral=True)
 
         p["cashed_out"] = True
         p["cash_mult"] = self.active_view.current_mult
         p["winnings"] = int(p["bet"] * self.active_view.current_mult)
-        await EconomyDB.update_balance(uid, wallet=p["winnings"])
+        await EconomyDB.update_balance(uid, wallet=p["winnings"], description="Crash Cashout")
 
         self.active_view._render()
         await interaction.response.edit_message(view=self.active_view)
@@ -462,21 +484,39 @@ class Gambling(commands.Cog):
         self.bot = bot
 
     # ==========================================
-    # BLACKJACK & MINES
+    # REGULAR GAMBLE (COIN FLIP / ROLL)
     # ==========================================
 
-    @commands.command(name="blackjack", aliases=["bj"])
-    async def blackjack_cmd(self, ctx: commands.Context, *, amount: str):
+    @commands.command(name="gamble", aliases=["bet", "roll"])
+    async def gamble_cmd(self, ctx: commands.Context, *, amount: str):
         data = await EconomyDB.get_user(ctx.author.id)
         bet = parse_bet(amount, data["wallet"])
-        if not bet or bet <= 0:
-            return await ctx.send(view=simple_view("❌ Enter a valid bet amount."))
-        if bet > data["wallet"]:
-            return await ctx.send(view=simple_view("❌ You don't have that much money in your wallet."))
+        if not bet or bet <= 0 or bet > data["wallet"]:
+            return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
-        view = BlackjackView(ctx.author.id, bet)
-        await ctx.send(view=view)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Gamble Bet")
+
+        win = random.random() < 0.49
+        if win:
+            winnings = bet * 2
+            await EconomyDB.update_balance(ctx.author.id, wallet=winnings, description="Gamble Win")
+            await EconomyDB.modify_treasury(-bet)
+            msg = f"🎉 You rolled a winning number and won **{format_cash(winnings)}**!"
+        else:
+            await EconomyDB.modify_treasury(bet)
+            msg = f"💀 The roll didn't go your way. You lost **{format_cash(bet)}**."
+
+        await ctx.send(
+            view=simple_view(
+                f"# 🎲 Gamble Result\n\n"
+                f"{msg}\n\n"
+                f"-# Bet: {format_cash_short(bet)}"
+            )
+        )
+
+    # ==========================================
+    # MINES
+    # ==========================================
 
     @commands.command(name="mines")
     async def mines_cmd(self, ctx: commands.Context, bombs: int, *, amount: str):
@@ -490,12 +530,29 @@ class Gambling(commands.Cog):
         if bet > data["wallet"]:
             return await ctx.send(view=simple_view("❌ You don't have that much money in your wallet."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Mines game bet")
         view = MinesView(ctx.author.id, bet, bombs)
         await ctx.send(view=view)
 
     # ==========================================
-    # SLOTS, DOUBLE, LADDER, HILO
+    # BLACKJACK
+    # ==========================================
+
+    @commands.command(name="blackjack", aliases=["bj"])
+    async def blackjack_cmd(self, ctx: commands.Context, *, amount: str):
+        data = await EconomyDB.get_user(ctx.author.id)
+        bet = parse_bet(amount, data["wallet"])
+        if not bet or bet <= 0:
+            return await ctx.send(view=simple_view("❌ Enter a valid bet amount."))
+        if bet > data["wallet"]:
+            return await ctx.send(view=simple_view("❌ You don't have that much money in your wallet."))
+
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Blackjack Bet")
+        view = BlackjackView(ctx.author.id, bet)
+        await ctx.send(view=view)
+
+    # ==========================================
+    # SLOTS, DOUBLE, LADDER
     # ==========================================
 
     @commands.command(name="slots", aliases=["slot"])
@@ -505,7 +562,7 @@ class Gambling(commands.Cog):
         if not bet or bet <= 0 or bet > data["wallet"]:
             return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Slots Bet")
         reels = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
         r1, r2, r3 = random.choice(reels), random.choice(reels), random.choice(reels)
 
@@ -522,7 +579,7 @@ class Gambling(commands.Cog):
 
         winnings = int(bet * mult)
         if winnings > 0:
-            await EconomyDB.update_balance(ctx.author.id, wallet=winnings)
+            await EconomyDB.update_balance(ctx.author.id, wallet=winnings, description="Slots Win")
             await EconomyDB.modify_treasury(-winnings + bet)
             res = f"🎉 Won **{format_cash(winnings)}** (x{mult})!"
         else:
@@ -534,7 +591,7 @@ class Gambling(commands.Cog):
                 f"### **🎰 Slot Machine**\n\n"
                 f"**[ {r1} | {r2} | {r3} ]**\n\n"
                 f"{res}\n"
-                f"**Bet:** {format_cash(bet)}"
+                f"**Bet:** {format_cash_short(bet)}"
             )
         )
 
@@ -545,7 +602,7 @@ class Gambling(commands.Cog):
         if not bet or bet <= 0 or bet > data["wallet"]:
             return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Double Bet")
 
         class DoubleView(discord.ui.LayoutView):
             def __init__(self, uid: int, original_bet: int):
@@ -600,7 +657,7 @@ class Gambling(commands.Cog):
                 if interaction.user.id != self.d_view.uid:
                     return
                 self.d_view.done = True
-                await EconomyDB.update_balance(self.d_view.uid, wallet=self.d_view.current_pot)
+                await EconomyDB.update_balance(self.d_view.uid, wallet=self.d_view.current_pot, description="Double Cashout")
                 self.d_view._render(f"💰 Successfully cashed out **{format_cash(self.d_view.current_pot)}**!")
                 await interaction.response.edit_message(view=self.d_view)
 
@@ -613,7 +670,7 @@ class Gambling(commands.Cog):
         if not bet or bet <= 0 or bet > data["wallet"]:
             return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Ladder Bet")
         rungs = [1.3, 1.8, 2.6, 4.0, 7.0, 15.0, 35.0, 100.0]
 
         class LadderView(discord.ui.LayoutView):
@@ -632,7 +689,7 @@ class Gambling(commands.Cog):
                 for i, r in enumerate(reversed(rungs)):
                     idx = len(rungs) - 1 - i
                     ptr = "👉 " if idx == self.step else "   "
-                    ladder_lines.append(f"{ptr}Rung {idx + 1}: **x{r}** ({format_cash(self.bet * r)})")
+                    ladder_lines.append(f"{ptr}Rung {idx + 1}: **x{r}** ({format_cash_short(self.bet * r)})")
 
                 container.add_item(
                     text_display(
@@ -657,20 +714,19 @@ class Gambling(commands.Cog):
             async def callback(self, interaction: discord.Interaction):
                 if interaction.user.id != self.l_view.uid:
                     return
-                # Chance of success decreases slightly higher up
                 chance = 0.75 - (self.l_view.step * 0.06)
                 if random.random() < chance:
                     self.l_view.step += 1
                     if self.l_view.step >= len(rungs):
                         self.l_view.done = True
                         pot = int(self.l_view.bet * rungs[-1])
-                        await EconomyDB.update_balance(self.l_view.uid, wallet=pot)
+                        await EconomyDB.update_balance(self.l_view.uid, wallet=pot, description="Ladder Top Win")
                         self.l_view._render(f"🏆 TOP OF THE LADDER! Won **{format_cash(pot)}**!")
                     else:
                         self.l_view._render("🧗 Advanced to next rung!")
                 else:
                     self.l_view.done = True
-                    self.l_view._render("💨 Slipped and fell off! You lost your bet.")
+                    self.l_view._render("💨 Slipped off! You lost your bet.")
                 await interaction.response.edit_message(view=self.l_view)
 
         class LadderCashoutBtn(discord.ui.Button):
@@ -683,14 +739,14 @@ class Gambling(commands.Cog):
                     return
                 self.l_view.done = True
                 pot = int(self.l_view.bet * rungs[max(0, self.l_view.step - 1)]) if self.l_view.step > 0 else self.l_view.bet
-                await EconomyDB.update_balance(self.l_view.uid, wallet=pot)
+                await EconomyDB.update_balance(self.l_view.uid, wallet=pot, description="Ladder Cashout")
                 self.l_view._render(f"💰 Cashed out **{format_cash(pot)}**!")
                 await interaction.response.edit_message(view=self.l_view)
 
         await ctx.send(view=LadderView(ctx.author.id, bet))
 
     # ==========================================
-    # SUPERGAMBLE, DICE, ROULETTE, CRASH
+    # SUPERGAMBLE (5M COOLDOWN), DICE, ROULETTE, CRASH
     # ==========================================
 
     @commands.command(name="supergamble", aliases=["sg"])
@@ -701,13 +757,12 @@ class Gambling(commands.Cog):
         if not bet or bet <= 0 or bet > data["wallet"]:
             return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
-        # 3% chance of hitting crazy multiplier (50x - 100x)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Supergamble Bet")
         win = random.random() < 0.03
         if win:
             mult = random.randint(50, 100)
             winnings = bet * mult
-            await EconomyDB.update_balance(ctx.author.id, wallet=winnings)
+            await EconomyDB.update_balance(ctx.author.id, wallet=winnings, description="Supergamble Jackpot")
             await EconomyDB.modify_treasury(-winnings + bet)
             await ctx.send(
                 view=simple_view(
@@ -737,36 +792,25 @@ class Gambling(commands.Cog):
         if c not in ("even", "odd", "1", "2", "3", "4", "5", "6"):
             return await ctx.send(view=simple_view("❌ Choice must be `even`, `odd`, or a single number `1-6`."))
 
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Dice Bet")
         roll = random.randint(1, 6)
 
         won = False
         mult = 0.0
         if c == "even" and roll % 2 == 0:
-            won = True
-            mult = 2.0
+            won, mult = True, 2.0
         elif c == "odd" and roll % 2 != 0:
-            won = True
-            mult = 2.0
+            won, mult = True, 2.0
         elif c.isdigit() and int(c) == roll:
-            won = True
-            mult = 6.0
+            won, mult = True, 6.0
 
         if won:
             winnings = int(bet * mult)
-            await EconomyDB.update_balance(ctx.author.id, wallet=winnings)
-            await ctx.send(
-                view=simple_view(
-                    f"🎲 Rolled a **{roll}**! You correctly predicted **{c}** and won **{format_cash(winnings)}** (x{mult})!"
-                )
-            )
+            await EconomyDB.update_balance(ctx.author.id, wallet=winnings, description="Dice Win")
+            await ctx.send(view=simple_view(f"🎲 Rolled a **{roll}**! You correctly predicted **{c}** and won **{format_cash(winnings)}** (x{mult})!"))
         else:
             await EconomyDB.modify_treasury(bet)
-            await ctx.send(
-                view=simple_view(
-                    f"🎲 Rolled a **{roll}**! Your prediction **{c}** failed. Lost **{format_cash(bet)}**."
-                )
-            )
+            await ctx.send(view=simple_view(f"🎲 Rolled a **{roll}**! Your prediction **{c}** failed. Lost **{format_cash(bet)}**."))
 
     @commands.command(name="roulette", aliases=["rr"])
     async def roulette_cmd(self, ctx: commands.Context, space: str, *, amount: str):
@@ -776,7 +820,7 @@ class Gambling(commands.Cog):
             return await ctx.send(view=simple_view("❌ Invalid bet amount."))
 
         sp = space.lower().strip()
-        await EconomyDB.update_balance(ctx.author.id, wallet=-bet)
+        await EconomyDB.update_balance(ctx.author.id, wallet=-bet, description="Roulette Bet")
 
         landed = random.randint(0, 36)
         red_nums = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
@@ -797,28 +841,17 @@ class Gambling(commands.Cog):
 
         if won:
             winnings = int(bet * mult)
-            await EconomyDB.update_balance(ctx.author.id, wallet=winnings)
-            await ctx.send(
-                view=simple_view(
-                    f"🎡 Ball landed on **{landed} ({color})**!\n"
-                    f"🎉 Win on `{sp}`! Received **{format_cash(winnings)}** (x{mult})!"
-                )
-            )
+            await EconomyDB.update_balance(ctx.author.id, wallet=winnings, description="Roulette Win")
+            await ctx.send(view=simple_view(f"🎡 Landed on **{landed} ({color})**!\n🎉 Win on `{sp}`! Received **{format_cash(winnings)}** (x{mult})!"))
         else:
             await EconomyDB.modify_treasury(bet)
-            await ctx.send(
-                view=simple_view(
-                    f"🎡 Ball landed on **{landed} ({color})**!\n"
-                    f"💀 Better luck next spin. Lost **{format_cash(bet)}**."
-                )
-            )
+            await ctx.send(view=simple_view(f"🎡 Landed on **{landed} ({color})**!\n💀 Better luck next spin. Lost **{format_cash(bet)}**."))
 
     @commands.command(name="crash")
     async def crash_cmd(self, ctx: commands.Context):
         lobby = CrashLobbyView(ctx.author.id)
         msg = await ctx.send(view=lobby)
 
-        # 15s Countdown to join
         await asyncio.sleep(15)
         lobby.closed = True
         lobby._render()
@@ -830,7 +863,6 @@ class Gambling(commands.Cog):
         active_game = CrashActiveView(lobby.players)
         await msg.edit(view=active_game)
 
-        # Multiplier Ticking Loop
         while not active_game.all_done:
             await asyncio.sleep(0.9)
             active_game.current_mult = round(active_game.current_mult + 0.15 + (active_game.current_mult * 0.05), 2)
