@@ -80,7 +80,7 @@ class DropClaimButton(discord.ui.Button):
         container.add_item(
             text_display(
                 f"# 💸 Money Drop Claimed!\n"
-                f"🎉 {interaction.user.mention} pocketed **{format_cash(self.parent_view.amount)}**!"
+                f"🎉 {interaction.user.mention} pocketed {format_cash(self.parent_view.amount)}!"
             )
         )
         self.parent_view.add_item(container)
@@ -144,7 +144,7 @@ class Economy(commands.Cog):
             bank=amt,
             description="Bank Deposit",
         )
-        await ctx.send(view=simple_view(f"🏦 Successfully deposited **{format_cash(amt)}** into your bank."))
+        await ctx.send(view=simple_view(f"🏦 Successfully deposited {format_cash(amt)} into your bank."))
 
     @commands.command(name="withdraw", aliases=["wd"])
     async def withdraw_cmd(self, ctx: commands.Context, *, amount: str):
@@ -161,7 +161,7 @@ class Economy(commands.Cog):
             bank=-amt,
             description="Bank Withdrawal",
         )
-        await ctx.send(view=simple_view(f"🏧 Successfully withdrew **{format_cash(amt)}** into your wallet."))
+        await ctx.send(view=simple_view(f"🏧 Successfully withdrew {format_cash(amt)} into your wallet."))
 
     # ==========================================
     # DAILY, WEEKLY, MONTHLY
@@ -279,7 +279,7 @@ class Economy(commands.Cog):
         await ctx.send(view=view)
 
     # ==========================================
-    # JOBS (NO MIN SHIFTS + 70% HIGH-END CHANCE)
+    # JOBS
     # ==========================================
 
     @commands.group(name="job", aliases=["jobs"], invoke_without_command=True)
@@ -326,13 +326,12 @@ class Economy(commands.Cog):
 
         target = JOBS[key]
 
-        if target["high_end"]:
-            if random.random() > 0.70:
-                return await ctx.send(
-                    view=simple_view(
-                        f"❌ Your interview for **{target['title']}** was rejected by HR (30% rejection)! Feel free to re-apply."
-                    )
+        if target["high_end"] and random.random() > 0.70:
+            return await ctx.send(
+                view=simple_view(
+                    f"❌ Your interview for **{target['title']}** was rejected by HR! Feel free to re-apply."
                 )
+            )
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE economy_users SET job_key = ?, last_worked = ? WHERE user_id = ?", (key, time.time(), ctx.author.id))
@@ -411,24 +410,31 @@ class Economy(commands.Cog):
         await self.job_work(ctx)
 
     # ==========================================
-    # LEADERBOARD (MATCHING image_9.png)
+    # LEADERBOARD (UNBOUNDED BIGINT SORTING)
     # ==========================================
 
     @commands.command(name="leaderboard", aliases=["lb", "rich"])
     async def leaderboard_cmd(self, ctx: commands.Context):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT user_id, (wallet + bank) as net FROM economy_users ORDER BY net DESC LIMIT 10"
-            ) as cur:
+            async with db.execute("SELECT user_id, wallet, bank FROM economy_users") as cur:
                 rows = await cur.fetchall()
 
+        all_users = []
+        for r in rows:
+            w = int(str(r["wallet"] or "0"))
+            b = int(str(r["bank"] or "0"))
+            all_users.append((r["user_id"], w + b))
+
+        all_users.sort(key=lambda x: x[1], reverse=True)
+        top_10 = all_users[:10]
+
         lines = []
-        for rank, r in enumerate(rows, start=1):
-            user = self.bot.get_user(r["user_id"])
-            tag = user.name if user else f"User {r['user_id']}"
-            crown = "👑 " if rank == 1 else f"{rank}. "
-            lines.append(f"{crown}{tag} ( {format_cash_short(r['net'])} )")
+        for rank, (uid, net) in enumerate(top_10, start=1):
+            user = self.bot.get_user(uid)
+            tag = user.name if user else f"User {uid}"
+            prefix_tag = "👑 " if rank == 1 else f"{rank}. "
+            lines.append(f"{prefix_tag}{tag} ( {format_cash_short(net)} )")
 
         view = discord.ui.LayoutView(timeout=180)
         container = discord.ui.Container(accent_color=EMBED_COLOR)
@@ -450,12 +456,11 @@ class Economy(commands.Cog):
         treasury, mult = await EconomyDB.get_econ_state()
 
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT SUM(wallet), SUM(bank), COUNT(*) FROM economy_users") as cur:
-                row = await cur.fetchone()
-                total_wallet = row[0] or 0
-                total_bank = row[1] or 0
-                total_accounts = row[2] or 0
+            async with db.execute("SELECT wallet, bank FROM economy_users") as cur:
+                rows = await cur.fetchall()
 
+        total_wallet = sum(int(str(r[0] or "0")) for r in rows)
+        total_bank = sum(int(str(r[1] or "0")) for r in rows)
         circulating = total_wallet + total_bank
 
         view = discord.ui.LayoutView(timeout=180)
@@ -468,7 +473,7 @@ class Economy(commands.Cog):
                 f"• **Circulating Supply:** {format_cash(circulating)}\n"
                 f"• **Total Bank Deposits:** {format_cash(total_bank)}\n"
                 f"• **Total Wallet Cash:** {format_cash(total_wallet)}\n"
-                f"• **Active Citizen Accounts:** {total_accounts:,}\n"
+                f"• **Active Citizen Accounts:** {len(rows):,}\n"
                 f"• **Federal Reserve Status:** 100% Unbounded Solvency"
             )
         )
@@ -497,12 +502,12 @@ class Economy(commands.Cog):
             stolen = random.randint(int(target_data["wallet"] * 0.15), int(target_data["wallet"] * 0.45))
             await EconomyDB.update_balance(target.id, wallet=-stolen, description=f"Robbed by {ctx.author.display_name}")
             await EconomyDB.update_balance(ctx.author.id, wallet=stolen, description=f"Robbery on {target.display_name}")
-            await ctx.send(view=simple_view(f"🥷 You pickpocketed **{format_cash(stolen)}** straight from {target.mention}'s wallet!"))
+            await ctx.send(view=simple_view(f"🥷 You pickpocketed {format_cash(stolen)} straight from {target.mention}'s wallet!"))
         else:
             fine = min(author_data["wallet"], random.randint(500, 2000))
             await EconomyDB.update_balance(ctx.author.id, wallet=-fine, description="Robbery fine")
             await EconomyDB.modify_treasury(fine)
-            await ctx.send(view=simple_view(f"🚨 Caught! You failed to rob {target.display_name} and paid a **{format_cash(fine)}** fine."))
+            await ctx.send(view=simple_view(f"🚨 Caught! You failed to rob {target.display_name} and paid a {format_cash(fine)} fine."))
 
     @commands.command(name="drop")
     async def drop_cmd(self, ctx: commands.Context, *, amount: str):
@@ -537,43 +542,43 @@ class Economy(commands.Cog):
     async def admin_givemoney(self, ctx: commands.Context, member: discord.Member, *, amount: str):
         if not await self.bot.is_owner(ctx.author):
             return
-        amt = parse_bet(amount, 10**18)
+        amt = parse_bet(amount, 10**303)
         if not amt or amt <= 0:
             return await ctx.send("❌ Enter a valid amount.")
 
         await EconomyDB.update_balance(member.id, wallet=amt, description="Admin Grant")
-        await ctx.send(f"✅ Granted **{format_cash(amt)}** to {member.mention}.")
+        await ctx.send(f"✅ Granted {format_cash(amt)} to {member.mention}.")
 
     @admin_group.command(name="takemoney")
     async def admin_takemoney(self, ctx: commands.Context, member: discord.Member, *, amount: str):
         if not await self.bot.is_owner(ctx.author):
             return
-        amt = parse_bet(amount, 10**18)
+        amt = parse_bet(amount, 10**303)
         if not amt or amt <= 0:
             return await ctx.send("❌ Enter a valid amount.")
 
         await EconomyDB.update_balance(member.id, wallet=-amt, description="Admin Revoke")
-        await ctx.send(f"✅ Deducted **{format_cash(amt)}** from {member.mention}.")
+        await ctx.send(f"✅ Deducted {format_cash(amt)} from {member.mention}.")
 
     @admin_group.command(name="setmoney")
     async def admin_setmoney(self, ctx: commands.Context, member: discord.Member, *, amount: str):
         if not await self.bot.is_owner(ctx.author):
             return
-        amt = parse_bet(amount, 10**18)
+        amt = parse_bet(amount, 10**303)
         if amt is None or amt < 0:
             return await ctx.send("❌ Enter a valid amount.")
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE economy_users SET wallet = ? WHERE user_id = ?", (amt, member.id))
+            await db.execute("UPDATE economy_users SET wallet = ? WHERE user_id = ?", (str(amt), member.id))
             await db.commit()
-        await ctx.send(f"✅ Set {member.mention}'s wallet balance to **{format_cash(amt)}**.")
+        await ctx.send(f"✅ Set {member.mention}'s wallet balance to {format_cash(amt)}.")
 
     @admin_group.command(name="reset")
     async def admin_reset(self, ctx: commands.Context, member: discord.Member):
         if not await self.bot.is_owner(ctx.author):
             return
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE economy_users SET wallet = 1000, bank = 0 WHERE user_id = ?", (member.id,))
+            await db.execute("UPDATE economy_users SET wallet = '1000', bank = '0' WHERE user_id = ?", (member.id,))
             await db.commit()
         await ctx.send(f"✅ Reset economy data for {member.mention}.")
 

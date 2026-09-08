@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import aiosqlite
 import os
-import random
 import re
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +20,32 @@ JOBS = {
     "doctor": {"title": "Doctor", "salary": 65000, "high_end": True},
     "ceo": {"title": "Corporate Executive", "salary": 160000, "high_end": True},
 }
+
+SCALES = [
+    ("centillion", "cent", 10**303),
+    ("googol", "googol", 10**100),
+    ("vigintillion", "vig", 10**63),
+    ("novemdecillion", "novemdec", 10**60),
+    ("octodecillion", "octodec", 10**57),
+    ("septendecillion", "septendec", 10**54),
+    ("sexdecillion", "sexdec", 10**51),
+    ("quindecillion", "quindec", 10**48),
+    ("quattuordecillion", "quattuordec", 10**45),
+    ("tredecillion", "tredec", 10**42),
+    ("duodecillion", "duodec", 10**39),
+    ("undecillion", "undec", 10**36),
+    ("decillion", "dec", 10**33),
+    ("nonillion", "non", 10**30),
+    ("octillion", "oct", 10**27),
+    ("septillion", "sep", 10**24),
+    ("sextillion", "sex", 10**21),
+    ("quintillion", "quin", 10**18),
+    ("quadrillion", "quad", 10**15),
+    ("trillion", "tril", 10**12),
+    ("billion", "bil", 10**9),
+    ("million", "mil", 10**6),
+    ("thousand", "k", 10**3),
+]
 
 
 def parse_bet(arg: str, user_wallet: int) -> int | None:
@@ -35,22 +61,43 @@ def parse_bet(arg: str, user_wallet: int) -> int | None:
     if raw == "75%":
         return max(1, (user_wallet * 3) // 4) if user_wallet > 0 else None
 
-    units = [
-        ("quintillion", 10**18), ("quin", 10**18),
-        ("quadrillion", 10**15), ("quad", 10**15), ("q", 10**15),
-        ("trillion", 10**12), ("tril", 10**12), ("t", 10**12),
-        ("billion", 10**9), ("bil", 10**9), ("b", 10**9),
-        ("million", 10**6), ("mil", 10**6), ("m", 10**6),
-        ("thousand", 10**3), ("k", 10**3),
-    ]
+    # Handle short single-letter aliases first
+    if raw.endswith("q") and not raw.endswith(("quad", "quin")):
+        num_part = raw[:-1].strip()
+        try:
+            return int(Decimal(num_part) * Decimal(10**15))
+        except Exception:
+            return None
 
-    for unit_name, multiplier in units:
-        if raw.endswith(unit_name):
-            num_part = raw[:-len(unit_name)].strip()
-            try:
-                return int(float(num_part) * multiplier)
-            except ValueError:
-                return None
+    if raw.endswith("t") and not raw.endswith("tril"):
+        num_part = raw[:-1].strip()
+        try:
+            return int(Decimal(num_part) * Decimal(10**12))
+        except Exception:
+            return None
+
+    if raw.endswith("b") and not raw.endswith("bil"):
+        num_part = raw[:-1].strip()
+        try:
+            return int(Decimal(num_part) * Decimal(10**9))
+        except Exception:
+            return None
+
+    if raw.endswith("m") and not raw.endswith("mil"):
+        num_part = raw[:-1].strip()
+        try:
+            return int(Decimal(num_part) * Decimal(10**6))
+        except Exception:
+            return None
+
+    for full_name, short_name, multiplier in SCALES:
+        for suffix in (full_name, short_name):
+            if raw.endswith(suffix):
+                num_part = raw[:-len(suffix)].strip()
+                try:
+                    return int(Decimal(num_part) * Decimal(multiplier))
+                except Exception:
+                    return None
 
     try:
         val = int(raw.replace(",", ""))
@@ -60,39 +107,29 @@ def parse_bet(arg: str, user_wallet: int) -> int | None:
 
 
 def format_cash(amount: int | float) -> str:
-    amount = float(amount)
+    amount = int(amount)
     abs_amt = abs(amount)
     sign = "-" if amount < 0 else ""
-    if abs_amt >= 10**18:
-        return f"🪙 **{sign}{abs_amt / 10**18:.2f} quintillion**"
-    if abs_amt >= 10**15:
-        return f"🪙 **{sign}{abs_amt / 10**15:.2f} quadrillion**"
-    if abs_amt >= 10**12:
-        return f"🪙 **{sign}{abs_amt / 10**12:.2f} trillion**"
-    if abs_amt >= 10**9:
-        return f"🪙 **{sign}{abs_amt / 10**9:.2f} billion**"
-    if abs_amt >= 10**6:
-        return f"🪙 **{sign}{abs_amt / 10**6:.2f} million**"
-    if abs_amt >= 10**3:
-        return f"🪙 **{sign}{abs_amt / 10**3:.2f} thousand**"
-    return f"🪙 **{sign}{int(abs_amt):,}**"
+
+    for full_name, _, multiplier in SCALES:
+        if abs_amt >= multiplier:
+            val = abs_amt / multiplier
+            return f"🪙 **{sign}{val:.2f} {full_name}**"
+
+    return f"🪙 **{sign}{abs_amt:,}**"
 
 
 def format_cash_short(amount: int | float) -> str:
-    abs_amt = abs(float(amount))
-    if abs_amt >= 10**18:
-        return f"{abs_amt / 10**18:.2f} quin"
-    if abs_amt >= 10**15:
-        return f"{abs_amt / 10**15:.2f} quad"
-    if abs_amt >= 10**12:
-        return f"{abs_amt / 10**12:.2f} tril"
-    if abs_amt >= 10**9:
-        return f"{abs_amt / 10**9:.2f} bil"
-    if abs_amt >= 10**6:
-        return f"{abs_amt / 10**6:.2f} mil"
-    if abs_amt >= 10**3:
-        return f"{abs_amt / 10**3:.2f}k"
-    return f"{int(abs_amt):,}"
+    amount = int(amount)
+    abs_amt = abs(amount)
+    sign = "-" if amount < 0 else ""
+
+    for _, short_name, multiplier in SCALES:
+        if abs_amt >= multiplier:
+            val = abs_amt / multiplier
+            return f"{sign}{val:.2f} {short_name}"
+
+    return f"{sign}{abs_amt:,}"
 
 
 class EconomyDB:
@@ -103,8 +140,8 @@ class EconomyDB:
                 """
                 CREATE TABLE IF NOT EXISTS economy_users (
                     user_id INTEGER PRIMARY KEY,
-                    wallet INTEGER DEFAULT 1000,
-                    bank INTEGER DEFAULT 0,
+                    wallet TEXT DEFAULT '1000',
+                    bank TEXT DEFAULT '0',
                     daily_ts REAL DEFAULT 0,
                     weekly_ts REAL DEFAULT 0,
                     monthly_ts REAL DEFAULT 0,
@@ -112,7 +149,7 @@ class EconomyDB:
                     job_key TEXT DEFAULT NULL,
                     job_shifts INTEGER DEFAULT 0,
                     last_worked REAL DEFAULT 0,
-                    loan_amount INTEGER DEFAULT 0,
+                    loan_amount TEXT DEFAULT '0',
                     loan_due REAL DEFAULT 0
                 )
                 """
@@ -123,7 +160,7 @@ class EconomyDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     type TEXT,
-                    amount REAL,
+                    amount TEXT,
                     description TEXT,
                     created_at REAL
                 )
@@ -152,11 +189,21 @@ class EconomyDB:
             async with db.execute("SELECT * FROM economy_users WHERE user_id = ?", (user_id,)) as cur:
                 row = await cur.fetchone()
                 if row:
-                    return dict(row)
+                    data = dict(row)
+                    data["wallet"] = int(str(data.get("wallet") or "0"))
+                    data["bank"] = int(str(data.get("bank") or "0"))
+                    data["loan_amount"] = int(str(data.get("loan_amount") or "0"))
+                    return data
+
             await db.execute("INSERT OR IGNORE INTO economy_users (user_id) VALUES (?)", (user_id,))
             await db.commit()
             async with db.execute("SELECT * FROM economy_users WHERE user_id = ?", (user_id,)) as cur:
-                return dict(await cur.fetchone())
+                row = await cur.fetchone()
+                data = dict(row)
+                data["wallet"] = int(str(data.get("wallet") or "0"))
+                data["bank"] = int(str(data.get("bank") or "0"))
+                data["loan_amount"] = int(str(data.get("loan_amount") or "0"))
+                return data
 
     @staticmethod
     async def update_balance(
@@ -166,15 +213,19 @@ class EconomyDB:
         bank: int = 0,
         description: str | None = None,
     ) -> None:
+        user = await EconomyDB.get_user(user_id)
+        new_wallet = max(0, user["wallet"] + wallet)
+        new_bank = max(0, user["bank"] + bank)
+
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 """
                 UPDATE economy_users
-                SET wallet = MAX(0, wallet + ?),
-                    bank = MAX(0, bank + ?)
+                SET wallet = ?,
+                    bank = ?
                 WHERE user_id = ?
                 """,
-                (wallet, bank, user_id),
+                (str(new_wallet), str(new_bank), user_id),
             )
             if description and (wallet != 0 or bank != 0):
                 net_change = wallet + bank
@@ -184,7 +235,7 @@ class EconomyDB:
                     INSERT INTO economy_transactions (user_id, type, amount, description, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (user_id, tx_type, abs(net_change), description, time.time()),
+                    (user_id, tx_type, str(abs(net_change)), description, time.time()),
                 )
             await db.commit()
 
@@ -202,7 +253,12 @@ class EconomyDB:
                 (user_id, limit),
             ) as cur:
                 rows = await cur.fetchall()
-                return [dict(r) for r in rows]
+                results = []
+                for r in rows:
+                    item = dict(r)
+                    item["amount"] = int(str(item.get("amount") or "0"))
+                    results.append(item)
+                return results
 
     @staticmethod
     async def get_econ_state() -> tuple[float, float]:
