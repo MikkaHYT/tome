@@ -13,40 +13,56 @@ from config import EMBED_COLOR, PREFIX
 
 DISPLAY_PREFIX = PREFIX if isinstance(PREFIX, str) else PREFIX[0]
 
-JUICE_WRLD_COG_NAMES = {
-    "juicewrld",
-    "juice_wrld",
-    "juice wrld",
-    "leak",
-    "leaks",
-    "session",
-    "sessions",
-    "snippet",
-    "snippets",
-    "songinfo",
-    "si",
-    "covers",
-    "cover",
-    "media",
-    "wrld",
-    "radio"
+# Predefined master categories with keywords for automatic grouping
+CATEGORY_CONFIG = {
+    "juice_wrld": {
+        "label": "Juice WRLD",
+        "description": "Leaks, stems, remasters, snippets, sessions, & audio",
+        "emoji": "🎵",
+        "keywords": (
+            "juice", "wrld", "leak", "stem", "remaster", "instrumental",
+            "session", "snippet", "snip", "makesnip", "songinfo", "cover",
+            "radio", "media", "track", "music", "discog", "si"
+        ),
+    },
+    "economy": {
+        "label": "Economy",
+        "description": "Wallet, bank, jobs, loans, daily rewards, & leaderboards",
+        "emoji": "🪙",
+        "keywords": (
+            "economy", "bank", "shop", "work", "job", "wallet",
+            "balance", "loan", "pay", "daily", "coin"
+        ),
+    },
+    "gambling": {
+        "label": "Gambling",
+        "description": "Blackjack, mines, slots, crash, roulette, & games",
+        "emoji": "🎲",
+        "keywords": (
+            "gambling", "gamble", "casino", "blackjack", "slot",
+            "slots", "mine", "mines", "crash", "roulette", "bet", "roll"
+        ),
+    },
+    "moderation": {
+        "label": "Moderation",
+        "description": "Ban, kick, mute, jail, and server security tools",
+        "emoji": "🛡️",
+        "keywords": (
+            "moderation", "mod", "admin", "jail", "punish",
+            "warn", "kick", "ban", "mute", "lock", "security"
+        ),
+    },
+    "utility": {
+        "label": "Utility & Tools",
+        "description": "Embed builder, server tools, bot latency, & general utilities",
+        "emoji": "🛠️",
+        "keywords": (
+            "utility", "util", "tools", "tool", "createembed", "embed",
+            "serverlist", "server", "info", "information", "bot",
+            "stats", "ping", "misc", "general", "config", "settings"
+        ),
+    },
 }
-
-CATEGORY_META = {
-    "juice_wrld": ("Juice WRLD", "Leaks, snippets, covers, sessions, and radio", "🎵"),
-    "economy": ("Economy", "Wallet, bank, jobs, loans, daily rewards, and leaderboards", "🪙"),
-    "gambling": ("Gambling", "Blackjack, mines, slots, crash, roulette, and games of chance", "🎲"),
-    "moderation": ("Moderation", "Ban, kick, mute, jail, and server tools", "🛡"),
-    "info": ("Information", "Bot latency and utility commands", "ℹ"),
-}
-
-
-def is_juice_wrld_cog(cog_name: str) -> bool:
-    normalized = cog_name.lower().replace("_", " ").replace("-", " ").strip()
-    if normalized in JUICE_WRLD_COG_NAMES:
-        return True
-    keywords = ("juice", "wrld", "leak", "snippet", "session", "songinfo", "cover", "radio")
-    return any(word in normalized for word in keywords)
 
 
 @dataclass(slots=True)
@@ -56,6 +72,73 @@ class HelpCategory:
     description: str
     commands: list[commands.Command]
     emoji: str | None = None
+
+
+def resolve_category_key(cog_name: str) -> str:
+    normalized = cog_name.lower().replace("_", " ").replace("-", " ").strip()
+    
+    for cat_key, meta in CATEGORY_CONFIG.items():
+        for kw in meta["keywords"]:
+            if kw in normalized.split() or normalized == kw:
+                return cat_key
+            if len(kw) >= 4 and kw in normalized:
+                return cat_key
+
+    # Fallback to Utility & Tools so stray 1-command cogs don't clutter the dropdown
+    return "utility"
+
+
+def _visible_commands(cog: commands.Cog) -> list[commands.Command]:
+    return [
+        command
+        for command in cog.get_commands()
+        if not command.hidden and command.name not in {"help", "helpme", "h"}
+    ]
+
+
+def build_category_map(bot: commands.Bot) -> dict[str, HelpCategory]:
+    grouped_commands: dict[str, list[commands.Command]] = {
+        key: [] for key in CATEGORY_CONFIG
+    }
+
+    seen_command_names: set[str] = set()
+
+    for cog_name, cog in bot.cogs.items():
+        if cog_name.lower() == "help":
+            continue
+        if "jishaku" in (getattr(cog, "__module__", "") or "").lower():
+            continue
+
+        command_list = _visible_commands(cog)
+        if not command_list:
+            continue
+
+        target_category = resolve_category_key(cog_name)
+
+        for cmd in command_list:
+            if cmd.qualified_name not in seen_command_names:
+                seen_command_names.add(cmd.qualified_name)
+                grouped_commands[target_category].append(cmd)
+
+    category_map: dict[str, HelpCategory] = {}
+
+    for key, meta in CATEGORY_CONFIG.items():
+        cmds = grouped_commands.get(key, [])
+        if cmds:
+            category_map[key] = HelpCategory(
+                key=key,
+                label=meta["label"],
+                description=meta["description"],
+                commands=sorted(cmds, key=lambda c: c.name.lower()),
+                emoji=meta["emoji"],
+            )
+
+    return category_map
+
+
+def _command_description(command: commands.Command) -> str:
+    text = command.description or command.help or "No description available."
+    return text.split("\n")[0].strip()
 
 
 def _command_permissions(command: commands.Command) -> str:
@@ -121,107 +204,24 @@ def _usage_syntax(command: commands.Command, prefix: str) -> str:
     return f"{base} {' '.join(tokens)}".strip() if tokens else base
 
 
-def _command_description(command: commands.Command) -> str:
-    text = command.description or command.help or "No description available."
-    return text.split("\n")[0]
-
-
-def _module_name(command: commands.Command) -> str:
-    cog_name = command.cog_name or "misc"
-    if is_juice_wrld_cog(cog_name):
-        return "juice wrld"
-    return cog_name.lower()
-
-
-def _visible_commands(cog: commands.Cog) -> list[commands.Command]:
-    return [
-        command
-        for command in cog.get_commands()
-        if not command.hidden and command.name not in {"help", "helpme", "h"}
-    ]
-
-
-def build_category_map(bot: commands.Bot) -> dict[str, HelpCategory]:
-    categories: dict[str, HelpCategory] = {}
-    juice_commands: list[commands.Command] = []
-
-    for cog_name, cog in bot.cogs.items():
-        if cog_name.lower() in {"help"}:
-            continue
-        if "jishaku" in (getattr(cog, "__module__", "") or "").lower():
-            continue
-
-        command_list = _visible_commands(cog)
-        if not command_list:
-            continue
-
-        if is_juice_wrld_cog(cog_name):
-            juice_commands.extend(command_list)
-            continue
-
-        key = cog_name.lower().replace(" ", "_")
-        meta = CATEGORY_META.get(key)
-        if meta:
-            label, description, emoji = meta
-        else:
-            label = cog_name
-            description = (cog.description or f"{len(command_list)} commands").split("\n")[0]
-            emoji = None
-
-        categories[key] = HelpCategory(
-            key=key,
-            label=label,
-            description=description,
-            commands=sorted(command_list, key=lambda cmd: cmd.name.lower()),
-            emoji=emoji,
-        )
-
-    if juice_commands:
-        label, description, emoji = CATEGORY_META["juice_wrld"]
-        categories["juice_wrld"] = HelpCategory(
-            key="juice_wrld",
-            label=label,
-            description=description,
-            commands=sorted(juice_commands, key=lambda cmd: cmd.name.lower()),
-            emoji=emoji,
-        )
-
-    ordered: dict[str, HelpCategory] = {}
-    # Prioritize Juice WRLD, Economy, and Gambling
-    for primary in ("juice_wrld", "economy", "gambling"):
-        if primary in categories:
-            ordered[primary] = categories.pop(primary)
-    for key in sorted(categories):
-        ordered[key] = categories[key]
-    return ordered
-
-
-def _command_labels(command_list: list[commands.Command]) -> str:
-    parts = []
-    for command in command_list:
-        if isinstance(command, commands.Group):
-            parts.append(f"{command.name} [{len(command.commands)}]")
-        else:
-            parts.append(command.name)
-    return ", ".join(parts)
-
-
-def _select_options(category_map: dict[str, HelpCategory]) -> list[discord.SelectOption]:
+def _select_options(category_map: dict[str, HelpCategory], current: str = "home") -> list[discord.SelectOption]:
     options = [
         discord.SelectOption(
             label="Home",
-            description="Back to the main menu",
+            description="Overview and bot information",
             emoji="🏠",
             value="home",
+            default=(current == "home"),
         )
     ]
     for category in category_map.values():
         options.append(
             discord.SelectOption(
                 label=category.label[:100],
-                description=category.description[:100],
+                description=f"{len(category.commands)} command(s) · {category.description}"[:100],
                 value=category.key,
                 emoji=category.emoji,
+                default=(current == category.key),
             )
         )
     return options[:25]
@@ -238,34 +238,48 @@ def build_home_view(
         if bot_user
         else "https://cdn.discordapp.com/embed/avatars/0.png"
     )
-    total = sum(len(category.commands) for category in category_map.values())
+    total_commands = sum(len(c.commands) for c in category_map.values())
+
     header = (
-        f"# {name}\n"
-        "> `(arg)` = required · `[arg]` = optional\n"
-        "> Commands with `[n]` have **subcommands.**\n\n"
-        f"-# **{total} commands** · `{DISPLAY_PREFIX}help <command>` for details"
+        f"# {name} Help\n"
+        f"> Select a category from the dropdown menu to view its commands.\n"
+        f"-# **{total_commands} commands** across **{len(category_map)} modules**"
     )
+
+    overview_lines = [
+        f"### **Modules Overview**",
+        "> `(param)` = required · `[param]` = optional · `[n]` = subcommands",
+        "",
+    ]
+    for category in category_map.values():
+        overview_lines.append(
+            f"**{category.emoji} {category.label}** · `{len(category.commands)}`\n"
+            f"-# {category.description}"
+        )
+
+    overview_text = "\n".join(overview_lines)
 
     class HomeView(discord.ui.LayoutView):
         def __init__(self) -> None:
             super().__init__(timeout=180)
             container = discord.ui.Container(accent_color=EMBED_COLOR)
+            
             container.add_item(
                 discord.ui.Section(
                     discord.ui.TextDisplay(header),
                     accessory=discord.ui.Thumbnail(media=avatar),
                 )
             )
-            container.add_item(
-                discord.ui.Separator(spacing=discord.SeparatorSpacing.small)
-            )
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            container.add_item(discord.ui.TextDisplay(overview_text))
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
             container.add_item(
                 discord.ui.ActionRow(
                     discord.ui.Select(
-                        placeholder="Select a category...",
+                        placeholder="Choose a category...",
                         min_values=1,
                         max_values=1,
-                        options=_select_options(category_map),
+                        options=_select_options(category_map, current="home"),
                         custom_id=select_id,
                     )
                 )
@@ -286,33 +300,69 @@ def build_category_view(
         if bot_user
         else "https://cdn.discordapp.com/embed/avatars/0.png"
     )
-    commands_str = _command_labels(category.commands)
-    content = (
-        f"# {category.label}\n"
+
+    header = (
+        f"# {category.emoji or '📁'} {category.label}\n"
         f"> {category.description}\n"
-        f"```yaml\n{commands_str}\n```"
+        f"-# Showing **{len(category.commands)}** available command(s)"
     )
+
+    command_blocks: list[str] = []
+    for cmd in category.commands:
+        desc = _command_description(cmd)
+        sub_tag = f" `[{len(cmd.commands)}]`" if isinstance(cmd, commands.Group) else ""
+        cmd_title = f"**`{DISPLAY_PREFIX}{cmd.name}`**{sub_tag}"
+
+        if desc and desc != "No description available.":
+            command_blocks.append(f"{cmd_title}\n-# {desc}")
+        else:
+            command_blocks.append(f"{cmd_title}")
+
+    # Chunk command blocks to avoid Discord text display component limits
+    text_chunks: list[str] = []
+    current_chunk: list[str] = []
+    current_len = 0
+
+    for block in command_blocks:
+        if current_len + len(block) + 2 > 2500:
+            text_chunks.append("\n\n".join(current_chunk))
+            current_chunk = [block]
+            current_len = len(block)
+        else:
+            current_chunk.append(block)
+            current_len += len(block) + 2
+
+    if current_chunk:
+        text_chunks.append("\n\n".join(current_chunk))
+
+    footer_tip = f"-# 💡 Tip: Type `{DISPLAY_PREFIX}help <command>` for detailed syntax, aliases, and examples."
 
     class CategoryView(discord.ui.LayoutView):
         def __init__(self) -> None:
             super().__init__(timeout=180)
             container = discord.ui.Container(accent_color=EMBED_COLOR)
+
             container.add_item(
                 discord.ui.Section(
-                    discord.ui.TextDisplay(content),
+                    discord.ui.TextDisplay(header),
                     accessory=discord.ui.Thumbnail(media=avatar),
                 )
             )
-            container.add_item(
-                discord.ui.Separator(spacing=discord.SeparatorSpacing.small)
-            )
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+            for chunk in text_chunks:
+                container.add_item(discord.ui.TextDisplay(chunk))
+
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+            container.add_item(discord.ui.TextDisplay(footer_tip))
+            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
             container.add_item(
                 discord.ui.ActionRow(
                     discord.ui.Select(
-                        placeholder="Select a category...",
+                        placeholder="Switch category...",
                         min_values=1,
                         max_values=1,
-                        options=_select_options(category_map),
+                        options=_select_options(category_map, current=category.key),
                         custom_id=select_id,
                     )
                 )
@@ -347,7 +397,7 @@ def build_command_embed(
     )
     embed.add_field(
         name="Aliases",
-        value=", ".join(command.aliases) if command.aliases else "n/a",
+        value=", ".join(f"`{a}`" for a in command.aliases) if command.aliases else "None",
         inline=True,
     )
     embed.add_field(name="Parameters", value=_format_params(command), inline=True)
@@ -367,7 +417,7 @@ def build_command_embed(
         inline=False,
     )
     embed.set_footer(
-        text=f"Page {page}/{total} ({total} entries) · Module: {_module_name(command)}",
+        text=f"Page {page}/{total} ({total} entries) · Module: {resolve_category_key(command.cog_name or '').replace('_', ' ').title()}",
         icon_url=author.display_avatar.url,
     )
     return embed
@@ -410,7 +460,7 @@ async def send_command_help(
         view = discord.ui.LayoutView(timeout=60)
         container = discord.ui.Container(accent_color=EMBED_COLOR)
         container.add_item(
-            discord.ui.TextDisplay("No help is available for that command.")
+            discord.ui.TextDisplay("❌ No help is available for that command.")
         )
         view.add_item(container)
         return await ctx.send(view=view)
