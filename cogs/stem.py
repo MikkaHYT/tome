@@ -2,31 +2,61 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import logging
-import time
+import re
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-import aiohttp
 import discord
+from curl_cffi.requests import AsyncSession
 from discord.ext import commands
 
-from config import EMBED_COLOR
+try:
+    from config import EMBED_COLOR
+except ImportError:
+    EMBED_COLOR = discord.Color.from_str("#2b2d31")
 
-logger = logging.getLogger("juicevault")
+logger = logging.getLogger("juicevault.stems")
 
-API_BASE = "https://api.juicevault.xyz"
-STEMS_LIST_ENDPOINT = f"{API_BASE}/music/stems/list"
-DOWNLOAD_ENDPOINT = f"{API_BASE}/music/download"
+JUICEVAULT_BASE = "https://api.juicevault.xyz"
+STEMS_LIST_ENDPOINT = f"{JUICEVAULT_BASE}/music/stems/list"
+DOWNLOAD_ENDPOINT = f"{JUICEVAULT_BASE}/music/download"
 
-CACHE_TTL = 300  # Cache stems for 5 minutes
+API_TIMEOUT = 25
+CACHE_TTL = 1800
 SELECT_TIMEOUT = 120
 VIEW_TIMEOUT = 900
+MAX_META_LENGTH = 90
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://juicevault.xyz/",
+    "Origin": "https://juicevault.xyz",
 }
+
+
+def clean_match_key(value: str) -> str:
+    if not value:
+        return ""
+    val = str(value)
+    val = re.sub(r"\.[a-zA-Z0-9]+$", "", val)
+    val = val.replace("&", " and ")
+    val = re.sub(r"[_\-./\\+]+", " ", val)
+    val = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", "", val)
+    val = re.sub(r"\b(?:stems?|edit|session|remake)\b", "", val, flags=re.IGNORECASE)
+    val = re.sub(r"[^\w\s]", "", val)
+    val = re.sub(r"\s+", " ", val).strip().lower()
+    return val if val else str(value).strip().lower()
+
+
+def truncate(value: str, limit: int = MAX_META_LENGTH) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
 
 
 def valid_http_url(value: Any) -> str | None:
@@ -44,41 +74,27 @@ def valid_http_url(value: Any) -> str | None:
     return value
 
 
-def resolve_cover_url(value: Any) -> str | None:
-    if not value or not isinstance(value, str):
+def resolve_vault_cover(path: str | None) -> str | None:
+    if not path or not isinstance(path, str):
         return None
-    value = value.strip()
-    if not value:
+    path = path.strip()
+    if path.startswith(("http://", "https://")):
+        return path
+    if path.startswith("//"):
+        return f"https:{path}"
+    if path.startswith("/"):
+        return f"{JUICEVAULT_BASE}{path}"
+    return f"{JUICEVAULT_BASE}/{path}"
+
+
+def format_iso_date(iso_str: str | None) -> str | None:
+    if not iso_str or not isinstance(iso_str, str):
         return None
-    if value.startswith(("http://", "https://")):
-        return value
-    if value.startswith("//"):
-        return f"https:{value}"
-    if value.startswith("/"):
-        return f"{API_BASE}{value}"
-    return f"{API_BASE}/{value}"
-
-
-def truncate(value: str, limit: int = 90) -> str:
-    value = value.strip()
-    if len(value) <= limit:
-        return value
-    return value[: limit - 3].rstrip() + "..."
-
-
-def make_link_button(label: str, url: str | None) -> discord.ui.Button | None:
-    url = valid_http_url(url)
-    if not url:
-        return None
-    return discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url)
-
-
-def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
-    view = discord.ui.LayoutView(timeout=timeout)
-    container = discord.ui.Container(accent_color=EMBED_COLOR)
-    container.add_item(discord.ui.TextDisplay(content))
-    view.add_item(container)
-    return view
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y")
+    except Exception:
+        return iso_str.split("T")[0]
 
 
 def text_display(content: str) -> discord.ui.TextDisplay:
@@ -89,186 +105,84 @@ def small_separator() -> discord.ui.Separator:
     return discord.ui.Separator(spacing=discord.SeparatorSpacing.small)
 
 
-def build_leak_header(song: dict[str, Any]) -> str:
-    title = song.get("title") or song.get("file_name") or "Unknown Track"
+def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=timeout)
+    container = discord.ui.Container(accent_color=EMBED_COLOR)
+    container.add_item(text_display(content))
+    view.add_item(container)
+    return view
+
+
+def make_link_button(label: str, url: str | None) -> discord.ui.Button | None:
+    url = valid_http_url(url)
+    if not url:
+        return None
+    return discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url)
+
+
+def build_stem_header(stem: dict[str, Any]) -> str:
+    title = stem.get("title") or stem.get("file_name") or "Unknown Stem"
     lines = [f"### **{title}**"]
 
-    alt_names = song.get("alt_names") or []
-    if isinstance(alt_names, list) and alt_names:
-        clean_alts = [str(a).strip() for a in alt_names if str(a).strip()]
+    alt_names = stem.get("alt_names") or []
+    if isinstance(alt_names, str):
+        alt_names = [a.strip() for a in alt_names.split(",") if a.strip()]
+    if alt_names:
+        clean_alts = [a for a in alt_names if a.lower() != title.lower()]
         if clean_alts:
             lines.append(f"-# Alt Name(s): **{', '.join(clean_alts)}**")
 
-    artist = song.get("artist")
-    if artist and str(artist).strip() != "N/A":
+    artist = stem.get("artist")
+    if artist:
         lines.append(f"-# Artist: **{artist}**")
+
+    category = stem.get("category")
+    if category:
+        lines.append(f"-# Category: **{str(category).title()}**")
 
     return "\n".join(lines)
 
 
-def build_leak_details(song: dict[str, Any]) -> str | None:
-    fields: list[str] = []
+def build_stem_details(stem: dict[str, Any]) -> str:
+    fields = []
 
-    file_name = song.get("file_name")
+    file_name = stem.get("file_name")
     if file_name:
         fields.append(f"**File Name**\n{file_name}")
 
-    category = song.get("category")
-    if category:
-        fields.append(f"**Category**\n{str(category).title()}")
-
-    length = song.get("length")
+    length = stem.get("length")
     if length:
         fields.append(f"**Length**\n{length}")
 
-    file_size = song.get("file_size")
+    file_size = stem.get("file_size")
     if file_size:
         fields.append(f"**File Size**\n{file_size}")
 
-    play_count = song.get("play_count")
+    if stem.get("is_session_edit"):
+        fields.append("**Type**\nStudio Session Edit")
+
+    added_at = format_iso_date(stem.get("archive_added_at"))
+    if added_at:
+        fields.append(f"**Vault Archive Date**\n{added_at}")
+
+    play_count = stem.get("play_count")
     if play_count is not None:
-        try:
-            fields.append(f"**Play Count**\n{int(play_count):,}")
-        except ValueError:
-            fields.append(f"**Play Count**\n{play_count}")
+        fields.append(f"**Vault Plays**\n{play_count:,}")
 
-    archive_added = song.get("archive_added_at")
-    if archive_added:
-        date_str = str(archive_added).split("T")[0]
-        fields.append(f"**Archived**\n{date_str}")
+    if file_name:
+        fields.append(f"**Available Files**\nStem: {file_name}")
 
-    return "\n\n".join(fields) if fields else None
+    return "\n\n".join(fields)
 
 
-class JuiceVaultAPI:
-    def __init__(self) -> None:
-        self.session: aiohttp.ClientSession | None = None
-        self._cache: list[dict[str, Any]] = []
-        self._last_fetched: float = 0
-        self._lock = asyncio.Lock()
-
-    async def start(self) -> None:
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=DEFAULT_HEADERS)
-
-    async def close(self) -> None:
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    async def fetch_all_stems(self) -> list[dict[str, Any]]:
-        now = time.monotonic()
-        if self._cache and (now - self._last_fetched < CACHE_TTL):
-            logger.debug("Serving stems list from local memory cache (%d items)", len(self._cache))
-            return self._cache
-
-        async with self._lock:
-            if self._cache and (now - self._last_fetched < CACHE_TTL):
-                return self._cache
-
-            await self.start()
-            logger.info("Connecting to JuiceVault API: %s", STEMS_LIST_ENDPOINT)
-            try:
-                assert self.session is not None
-                async with self.session.get(
-                    STEMS_LIST_ENDPOINT,
-                    timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    logger.info("JuiceVault HTTP response status: %d (Content-Type: %s)", resp.status, resp.content_type)
-
-                    if resp.status != 200:
-                        body_preview = (await resp.text())[:300]
-                        logger.error("JuiceVault API failed with HTTP %d. Body preview: %s", resp.status, body_preview)
-                        return self._cache
-
-                    data = await resp.json(content_type=None)
-                    logger.info("JuiceVault raw response payload parsed as: %s", type(data).__name__)
-
-                    # Extract array if nested inside an object
-                    stems_list: list[dict[str, Any]] = []
-                    if isinstance(data, list):
-                        stems_list = data
-                    elif isinstance(data, dict):
-                        logger.info("Response is a dict with keys: %s", list(data.keys()))
-                        for key in ("stems", "data", "items", "results", "songs", "tracks"):
-                            if isinstance(data.get(key), list):
-                                logger.info("Unwrapped stems list from key: %r", key)
-                                stems_list = data[key]
-                                break
-
-                    if not stems_list:
-                        logger.warning("Could not locate stem entries in response data: %s", str(data)[:250])
-                    else:
-                        self._cache = stems_list
-                        self._last_fetched = now
-                        logger.info("Successfully cached %d stems from JuiceVault", len(self._cache))
-
-            except asyncio.TimeoutError:
-                logger.error("Connection timed out while querying JuiceVault: %s", STEMS_LIST_ENDPOINT)
-            except Exception as e:
-                logger.exception("Unexpected exception occurred while loading stems: %s", e)
-
-        return self._cache
-
-    async def search_stems(self, query: str) -> list[dict[str, Any]]:
-        stems = await self.fetch_all_stems()
-        logger.info("Evaluating search query %r against %d cached stems", query, len(stems))
-
-        if not stems:
-            logger.error("Stems cache is empty. Search cannot produce results.")
-            return []
-
-        clean_query = query.strip().casefold()
-        exact_matches: list[dict[str, Any]] = []
-        partial_matches: list[dict[str, Any]] = []
-        fuzzy_matches: list[tuple[float, dict[str, Any]]] = []
-
-        for item in stems:
-            title = str(item.get("title") or "").strip().casefold()
-            filename = str(item.get("file_name") or "").strip().casefold()
-            alts = [str(a).strip().casefold() for a in (item.get("alt_names") or []) if a]
-
-            if clean_query == title or clean_query == filename or clean_query in alts:
-                exact_matches.append(item)
-            elif clean_query in title or clean_query in filename or any(clean_query in a for a in alts):
-                partial_matches.append(item)
-            else:
-                score = max(
-                    difflib.SequenceMatcher(None, clean_query, title).ratio(),
-                    difflib.SequenceMatcher(None, clean_query, filename).ratio(),
-                )
-                if score >= 0.65:
-                    fuzzy_matches.append((score, item))
-
-        fuzzy_matches.sort(key=lambda x: x[0], reverse=True)
-        ranked_fuzzy = [item for _, item in fuzzy_matches]
-
-        combined = exact_matches + partial_matches + ranked_fuzzy
-        seen_ids: set[str] = set()
-        deduped: list[dict[str, Any]] = []
-        for song in combined:
-            sid = song.get("id") or song.get("file_name")
-            if sid not in seen_ids:
-                seen_ids.add(sid)
-                deduped.append(song)
-
-        logger.info(
-            "Search results for %r: %d found (Exact: %d, Partial: %d, Fuzzy: %d)",
-            query, len(deduped), len(exact_matches), len(partial_matches), len(ranked_fuzzy)
-        )
-        return deduped[:25]
-
-
-class LeakView(discord.ui.LayoutView):
-    def __init__(self, song: dict[str, Any], *, timeout: int = VIEW_TIMEOUT) -> None:
+class StemView(discord.ui.LayoutView):
+    def __init__(self, stem: dict[str, Any], timeout: int = VIEW_TIMEOUT) -> None:
         super().__init__(timeout=timeout)
 
-        song_id = song.get("id")
-        download_url = f"{DOWNLOAD_ENDPOINT}/{song_id}" if song_id else None
-        cover_url = resolve_cover_url(song.get("cover"))
-
         container = discord.ui.Container(accent_color=EMBED_COLOR)
+        header_text = build_stem_header(stem)
+        cover_url = resolve_vault_cover(stem.get("cover"))
 
-        header_text = build_leak_header(song)
         if cover_url:
             container.add_item(
                 discord.ui.Section(
@@ -281,41 +195,50 @@ class LeakView(discord.ui.LayoutView):
 
         container.add_item(small_separator())
 
-        details_text = build_leak_details(song)
+        details_text = build_stem_details(stem)
         if details_text:
             container.add_item(text_display(details_text))
 
-        if download_url:
-            button = make_link_button("Download", download_url)
-            if button:
-                container.add_item(small_separator())
-                container.add_item(discord.ui.ActionRow(button))
+        stem_id = stem.get("id")
+        action_rows: list[discord.ui.ActionRow] = []
+
+        if stem_id:
+            dl_url = f"{DOWNLOAD_ENDPOINT}/{stem_id}"
+            download_btn = make_link_button("Download", dl_url)
+            if download_btn:
+                action_rows.append(discord.ui.ActionRow(download_btn))
+
+        if action_rows:
+            container.add_item(small_separator())
+            for row in action_rows:
+                container.add_item(row)
 
         self.add_item(container)
 
 
-class LeakSongSelect(discord.ui.Select):
-    def __init__(self, candidates: list[dict[str, Any]], author_id: int) -> None:
+class StemSelect(discord.ui.Select):
+    def __init__(self, candidates: list[dict[str, Any]], author_id: int, cog: Stem) -> None:
         self.candidates = candidates
         self.author_id = author_id
+        self.cog = cog
 
         options = []
-        for idx, result in enumerate(candidates[:25]):
-            title = str(result.get("title") or result.get("file_name") or f"Track {idx + 1}")
-            length = result.get("length")
-            category = str(result.get("category", "Stem")).title()
-            desc = f"{category} • {length}" if length else category
+        for idx, item in enumerate(candidates[:25]):
+            title = str(item.get("title") or item.get("file_name") or "Stem")[:100]
+            size = item.get("file_size") or ""
+            length = item.get("length") or ""
+            desc = f"{length} • {size}" if length and size else (length or size or "JuiceVault Stem")
 
             options.append(
                 discord.SelectOption(
-                    label=title[:100],
+                    label=title,
                     value=str(idx),
                     description=desc[:100],
                 )
             )
 
         super().__init__(
-            placeholder="Choose the correct track...",
+            placeholder="Choose the correct stem...",
             min_values=1,
             max_values=1,
             options=options,
@@ -329,31 +252,44 @@ class LeakSongSelect(discord.ui.Select):
             )
             return
 
+        if self.view:
+            self.view.selected = True
+            self.view.stop()
+
+        await interaction.response.defer()
         chosen = self.candidates[int(self.values[0])]
-        view = LeakView(chosen)
-        await interaction.response.edit_message(view=view)
+        logger.info("[StemSelect] User picked: %s (id=%s)", chosen.get("title"), chosen.get("id"))
+
+        try:
+            view = StemView(chosen)
+            await interaction.edit_original_response(view=view)
+        except discord.HTTPException:
+            logger.exception("[StemSelect] Discord rejected layout view.")
+            await self.cog.edit_with_error(interaction, "❌ Discord rejected the stem card.")
+        except Exception:
+            logger.exception("[StemSelect] Failed to render selected stem.")
+            await self.cog.edit_with_error(interaction, "❌ Failed to build the stem card.")
 
 
-class LeakSongSelectView(discord.ui.LayoutView):
-    def __init__(self, query: str, candidates: list[dict[str, Any]], author_id: int) -> None:
+class StemSelectView(discord.ui.LayoutView):
+    def __init__(self, query: str, candidates: list[dict[str, Any]], author_id: int, cog: Stem) -> None:
         super().__init__(timeout=SELECT_TIMEOUT)
-        self.message: discord.Message | None = None
+        self.selected = False
+        self.message: Optional[discord.Message] = None
 
         container = discord.ui.Container(accent_color=EMBED_COLOR)
         container.add_item(
             text_display(
-                f"# Command: leak\n"
-                f"Found **{len(candidates)}** matching tracks for **{query}**.\n"
-                f"Select the correct track from the dropdown below:"
+                f"# Command: stem\n"
+                f"Found **{len(candidates)}** matching stems for **{query}**.\n"
+                f"-# Select the correct track from the dropdown below:"
             )
         )
-        container.add_item(
-            discord.ui.ActionRow(LeakSongSelect(candidates, author_id))
-        )
+        container.add_item(discord.ui.ActionRow(StemSelect(candidates, author_id, cog)))
         self.add_item(container)
 
     async def on_timeout(self) -> None:
-        if not self.message:
+        if self.selected or not self.message:
             return
         try:
             await self.message.edit(
@@ -363,7 +299,174 @@ class LeakSongSelectView(discord.ui.LayoutView):
             pass
 
 
-class Leak(commands.Cog):
+class JuiceVaultAPI:
+    def __init__(self) -> None:
+        self.session: Optional[AsyncSession] = None
+        self._stems_cache: list[dict[str, Any]] = []
+        self._cache_timestamp: float = 0
+        self._cache_lock = asyncio.Lock()
+
+    async def get_session(self) -> AsyncSession:
+        if self.session is None:
+            self.session = AsyncSession(impersonate="chrome124", timeout=API_TIMEOUT)
+        return self.session
+
+    async def close(self) -> None:
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    @staticmethod
+    def extract_results(data: Any) -> list[dict[str, Any]]:
+        if not data:
+            return []
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            for key in ("stems", "data", "songs", "results", "items", "files"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    return [item for item in val if isinstance(item, dict)]
+            for val in data.values():
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    return val
+        return []
+
+    async def _ensure_stems_index(self, force: bool = False) -> list[dict[str, Any]]:
+        now = asyncio.get_running_loop().time()
+        if not force and self._stems_cache and (now - self._cache_timestamp < CACHE_TTL):
+            return self._stems_cache
+
+        async with self._cache_lock:
+            if not force and self._stems_cache and (now - self._cache_timestamp < CACHE_TTL):
+                return self._stems_cache
+
+            logger.info("[JuiceVault] Fetching stems list with browser impersonation: %s", STEMS_LIST_ENDPOINT)
+            session = await self.get_session()
+            try:
+                resp = await session.get(STEMS_LIST_ENDPOINT, headers=HEADERS)
+                logger.info(
+                    "[JuiceVault] Response status: %d | Body size: %d bytes",
+                    resp.status_code,
+                    len(resp.content),
+                )
+
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = json.loads(resp.text)
+
+                    stems = self.extract_results(data)
+                    if stems:
+                        self._stems_cache = stems
+                        self._cache_timestamp = now
+                        logger.info("[JuiceVault] Successfully indexed %d stems.", len(stems))
+                    else:
+                        logger.warning("[JuiceVault] 200 OK returned but 0 items extracted.")
+                else:
+                    logger.error("[JuiceVault] Request failed with HTTP %d: %s", resp.status_code, resp.text[:250])
+            except Exception as e:
+                logger.exception("[JuiceVault] Request exception during indexing: %s", e)
+
+        return self._stems_cache
+
+    async def search_stems(self, query: str) -> list[dict[str, Any]]:
+        stems = await self._ensure_stems_index()
+        if not stems:
+            logger.warning("[JuiceVault] Cache empty. Retrying fetch...")
+            stems = await self._ensure_stems_index(force=True)
+            if not stems:
+                return []
+
+        clean_q = clean_match_key(query)
+        raw_q = query.strip().lower()
+        if not clean_q and not raw_q:
+            return []
+
+        q_tokens = [tok for tok in clean_q.split() if tok]
+
+        exact_matches: list[dict[str, Any]] = []
+        word_boundary_matches: list[dict[str, Any]] = []
+        token_matches: list[dict[str, Any]] = []
+        partial_matches: list[dict[str, Any]] = []
+        fuzzy_matches: list[tuple[float, dict[str, Any]]] = []
+
+        for stem in stems:
+            title = stem.get("title") or ""
+            file_name = stem.get("file_name") or ""
+            clean_title = clean_match_key(title)
+            clean_file = clean_match_key(file_name)
+
+            alt_names = stem.get("alt_names") or []
+            if isinstance(alt_names, str):
+                alt_names = [a.strip() for a in alt_names.split(",") if a.strip()]
+            clean_alts = [clean_match_key(a) for a in alt_names if clean_match_key(a)]
+
+            all_clean = [k for k in (clean_title, clean_file, *clean_alts) if k]
+            all_raw = [str(k).lower() for k in (title, file_name, *alt_names) if k]
+
+            if clean_q in all_clean or raw_q in all_raw:
+                exact_matches.append(stem)
+                continue
+
+            matched_wb = False
+            for k in all_clean:
+                if re.search(rf"\b{re.escape(clean_q)}\b", k):
+                    word_boundary_matches.append(stem)
+                    matched_wb = True
+                    break
+            if matched_wb:
+                continue
+
+            if q_tokens and all(any(tok in k for k in all_clean) for tok in q_tokens):
+                token_matches.append(stem)
+                continue
+
+            matched_partial = False
+            for k in all_clean:
+                if (len(clean_q) >= 2 and clean_q in k) or (len(k) >= 2 and k in clean_q):
+                    partial_matches.append(stem)
+                    matched_partial = True
+                    break
+            if matched_partial:
+                continue
+
+            best_score = 0.0
+            for k in all_clean:
+                score = difflib.SequenceMatcher(None, clean_q, k).ratio()
+                if score > best_score:
+                    best_score = score
+
+            if best_score >= 0.60:
+                fuzzy_matches.append((best_score, stem))
+
+        if exact_matches:
+            logger.info("[JuiceVault] %d exact matches found for '%s'", len(exact_matches), query)
+            return exact_matches[:25]
+
+        fuzzy_matches.sort(key=lambda x: x[0], reverse=True)
+        ordered_fuzzy = [item for _, item in fuzzy_matches]
+
+        combined: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        for pool in (word_boundary_matches, token_matches, partial_matches, ordered_fuzzy):
+            for s in pool:
+                s_id = str(s.get("id") or s.get("file_name") or id(s))
+                if s_id not in seen_ids:
+                    seen_ids.add(s_id)
+                    combined.append(s)
+
+        logger.info(
+            "[JuiceVault] Search returned %d candidates for query '%s'",
+            len(combined[:25]),
+            query,
+        )
+        return combined[:25]
+
+
+class Stem(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.api = JuiceVaultAPI()
@@ -371,49 +474,80 @@ class Leak(commands.Cog):
     def cog_unload(self) -> None:
         asyncio.create_task(self.api.close())
 
-    @commands.command(name="leak", aliases=["song", "stem", "stems"])
-    async def leak(self, ctx: commands.Context, *, query: str | None = None) -> None:
+    async def send_error(self, ctx: commands.Context, message: str) -> None:
+        await ctx.send(view=simple_view(message))
+
+    async def edit_with_error(self, interaction: discord.Interaction, message: str) -> None:
+        try:
+            await interaction.edit_original_response(view=simple_view(message))
+        except Exception:
+            pass
+
+    @commands.command(name="stem", aliases=["stems", "vaultstem", "stemdownload"])
+    @commands.cooldown(1, 3, commands.BucketType.user)
+    async def stem_command(self, ctx: commands.Context, *, query: str | None = None) -> None:
         if not query:
             help_view = simple_view(
-                "# Command: leak\n\n"
+                "# Command: stem\n\n"
                 "**Syntax**\n"
-                f"`{ctx.clean_prefix}leak <track>`\n\n"
+                "`,stem <song>`\n\n"
                 "**Example**\n"
-                f"`{ctx.clean_prefix}leak Netflix & Pills`"
+                "`,stem 20`\n"
+                "`,stem netflix & pills`"
             )
             await ctx.send(view=help_view)
             return
 
-        logger.info("[Command Invoked] %s by %s (%d) with query: %r", ctx.invoked_with, ctx.author, ctx.author.id, query)
-        candidates = await self.api.search_stems(query)
+        searching_msg = await ctx.send(view=simple_view(f"🔍 Searching JuiceVault stems for **{query}**..."))
 
-        if not candidates:
-            await ctx.send(view=simple_view(f"❌ Couldn't find any stems matching **{query}**."))
+        results = await self.api.search_stems(query)
+        if not results:
+            await searching_msg.edit(
+                view=simple_view(f"❌ Couldn't find any stems matching **{query}**.")
+            )
             return
 
-        wanted = query.strip().casefold()
+        clean_q = clean_match_key(query)
         exact_match = next(
             (
-                s for s in candidates
-                if str(s.get("title") or "").strip().casefold() == wanted
-                or str(s.get("file_name") or "").strip().casefold() == wanted
+                s for s in results
+                if clean_match_key(s.get("title", "")) == clean_q
+                or clean_match_key(s.get("file_name", "")) == clean_q
             ),
             None,
         )
 
-        if len(candidates) == 1 or exact_match is not None:
-            song = exact_match or candidates[0]
-            view = LeakView(song)
-            await ctx.send(view=view)
+        if len(results) == 1 or exact_match is not None:
+            chosen = exact_match or results[0]
+            try:
+                view = StemView(chosen)
+                await searching_msg.edit(view=view)
+            except discord.HTTPException:
+                logger.exception("[Command:stem] Discord layout rejected.")
+                await searching_msg.edit(view=simple_view("❌ Discord rejected the stem card."))
+            except Exception:
+                logger.exception("[Command:stem] Failed to build direct stem card.")
+                await searching_msg.edit(view=simple_view("❌ Failed to build the stem card."))
             return
 
-        select_view = LeakSongSelectView(
+        dropdown_view = StemSelectView(
             query=query,
-            candidates=candidates,
+            candidates=results,
             author_id=ctx.author.id,
+            cog=self,
         )
-        select_view.message = await ctx.send(view=select_view)
+        await searching_msg.edit(view=dropdown_view)
+        dropdown_view.message = searching_msg
+
+    @stem_command.error
+    async def stem_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"⏱️ Try again in **{error.retry_after:.1f}s**.")
+            return
+
+        logger.exception("[Command:stem] Unhandled command error: %s", error)
+        await ctx.send(f"❌ **Stem error:** `{error}`")
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Leak(bot))
+    await bot.add_cog(Stem(bot))
