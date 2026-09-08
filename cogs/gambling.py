@@ -52,7 +52,6 @@ class MinesView(discord.ui.LayoutView):
         safe_hits = len(self.revealed)
         if safe_hits == 0:
             return 1.0
-        # Authentic 97% RTP curve
         mult = 0.97 * (math.comb(25, safe_hits) / math.comb(25 - self.bomb_count, safe_hits))
         return round(mult, 2)
 
@@ -91,7 +90,6 @@ class MinesView(discord.ui.LayoutView):
         container.add_item(text_display(header))
         container.add_item(small_separator())
 
-        # Render 5x5 Grid Buttons
         for row in range(5):
             btn_row = []
             for col in range(5):
@@ -344,7 +342,7 @@ class BlackjackDouble(discord.ui.Button):
 
 
 # ============================================================
-# MULTIPLAYER CRASH
+# MULTIPLAYER CRASH (MINIMUM 1.70x CRASH GUARANTEE)
 # ============================================================
 
 class CrashLobbyView(discord.ui.LayoutView):
@@ -376,7 +374,7 @@ class CrashLobbyView(discord.ui.LayoutView):
 
 
 class CrashJoinModal(discord.ui.Modal, title="Enter Crash Bet"):
-    bet_input = discord.ui.TextInput(label="Bet Amount (e.g. 100k, half, max)", placeholder="10k", required=True)
+    bet_input = discord.ui.TextInput(label="Bet Amount (e.g. 100k, half, max, 99quin)", placeholder="10k", required=True)
 
     def __init__(self, lobby_view: CrashLobbyView):
         super().__init__()
@@ -390,8 +388,10 @@ class CrashJoinModal(discord.ui.Modal, title="Enter Crash Bet"):
 
         await EconomyDB.update_balance(interaction.user.id, wallet=-amt, description="Crash Bet")
 
+        # 1.70x minimum crash threshold to prevent instant drops
         r = random.random()
-        crash_point = round(max(1.05, 0.96 / (1.0 - r)), 2)
+        raw_crash = 0.96 / (1.0 - r)
+        crash_point = round(max(1.70, raw_crash), 2)
 
         self.lobby_view.players[interaction.user.id] = {
             "name": interaction.user.display_name,
