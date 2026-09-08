@@ -66,7 +66,7 @@ class TTS(commands.Cog):
                     None,
                     lambda: self.client.text_to_speech.convert(
                         text=text,
-                        voice_id="YDCfZMLWcUmsGvqHq0rS",
+                        voice_id="JBFqnCBsd6RMkjVDRZzb",
                         model_id=MODEL_ID,
                         output_format=OUTPUT_FORMAT,
                     ),
