@@ -1,0 +1,1247 @@
+import asyncio
+import html
+import json
+import logging
+import random
+import re
+from typing import Any, Optional
+from urllib.parse import quote, urlparse
+
+import aiohttp
+import discord
+from discord.ext import commands
+
+logger = logging.getLogger(__name__)
+
+API_ROOT = "https://juicewrldapi.com"
+API_BASE = f"{API_ROOT}/juicewrld"
+SONGS_ENDPOINT = f"{API_BASE}/songs/"
+BROWSE_ENDPOINT = f"{API_BASE}/files/browse/"
+FILE_INFO_ENDPOINT = f"{API_BASE}/files/info/"
+DOWNLOAD_ENDPOINT = f"{API_BASE}/files/download/"
+RADIO_RANDOM_ENDPOINT = f"{API_BASE}/radio/random/"
+
+API_TIMEOUT = 30
+MAX_RESULTS = 25
+
+EMBED_COLOR = discord.Color.from_str("#2b2d31")
+
+
+def clean(value: Any):
+    if value is None:
+        return None
+    if callable(value):
+        try:
+            value = value()
+        except TypeError:
+            return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    return value
+
+
+def get_value(obj: Any, *names: str, default=None):
+    if obj is None:
+        return default
+    for name in names:
+        if isinstance(obj, dict):
+            value = obj.get(name)
+        else:
+            value = getattr(obj, name, None)
+        value = clean(value)
+        if value is not None:
+            return value
+    return default
+
+
+def recursive_find(obj: Any, names):
+    wanted = {str(x).casefold() for x in names}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if str(key).casefold() in wanted:
+                value = clean(value)
+                if value is not None:
+                    return value
+        for value in obj.values():
+            found = recursive_find(value, names)
+            if found is not None:
+                return found
+    elif isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            found = recursive_find(item, names)
+            if found is not None:
+                return found
+    return None
+
+
+def first_value(obj: Any, *names: str, default=None):
+    value = get_value(obj, *names, default=None)
+    if value is not None:
+        return value
+    value = recursive_find(obj, names)
+    if value is not None:
+        return value
+    return default
+
+
+def display(value: Any, default="N/A"):
+    value = clean(value)
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            result = display(item, "")
+            if result:
+                values.append(result)
+        return ", ".join(values) if values else default
+    if isinstance(value, dict):
+        for key in ("name", "title", "value", "text", "label"):
+            if key in value:
+                result = display(value[key], "")
+                if result:
+                    return result
+        return default
+    return str(value)
+
+
+def display_list(value: Any, default="N/A"):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip() or default
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            result = display(item, "")
+            if result:
+                values.append(result)
+        return ", ".join(values) if values else default
+    return display(value, default)
+
+
+def unwrap_named(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get("name") or value.get("title") or value.get("value")
+    return value
+
+
+def normalize_title(value: str):
+    if not value:
+        return ""
+    value = str(value).lower()
+    value = re.sub(r"\([^)]*\)", "", value)
+    value = re.sub(r"\[[^\]]*\]", "", value)
+    value = re.sub(r"\{[^}]*\}", "", value)
+    value = re.sub(r"\.(mp3|m4a|wav|flac|ogg|aac)$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[_\-]+", " ", value)
+    value = re.sub(r"[^\w\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def title_matches(wanted: str, filename: str):
+    a = normalize_title(wanted)
+    b = normalize_title(filename)
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    return False
+
+
+def valid_http_url(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+    except Exception:
+        return None
+    return value
+
+
+def normalize_path(path):
+    if not path:
+        return None
+    path = str(path).strip()
+    if not path or path.startswith(("http://", "https://")):
+        return None
+    while path.startswith("/"):
+        path = path[1:]
+    return path
+
+
+def make_download_url(path):
+    path = normalize_path(path)
+    if not path:
+        return None
+    return f"{DOWNLOAD_ENDPOINT}?path={quote(path, safe='')}&channel=comp"
+
+
+def clean_era_display(era_raw: Any) -> str | None:
+    if not era_raw:
+        return None
+    val = ""
+    if isinstance(era_raw, dict):
+        val = era_raw.get("description") or era_raw.get("name") or era_raw.get("title") or ""
+    elif isinstance(era_raw, str):
+        val = era_raw
+    if not val or val == "N/A":
+        return None
+    val = re.sub(r"\s*\([^)]*\)", "", val)
+    val = re.sub(r"\s+era$", "", val, flags=re.IGNORECASE)
+    return val.strip() or None
+
+
+def is_post_era(era_name: str) -> bool:
+    if not era_name:
+        return False
+    norm = era_name.strip().lower()
+    if norm in ("post", "post-era", "post era"):
+        return True
+    return bool(re.search(r"\bpost(?:[- ]?mortem|[- ]?death|humous)?\b", norm))
+
+
+def song_title(song):
+    return display(
+        first_value(
+            song,
+            "name",
+            "title",
+            "song_title",
+            "songTitle",
+            default="Unknown Song",
+        ),
+        "Unknown Song",
+    )
+
+
+def song_category(song):
+    value = first_value(
+        song,
+        "category",
+        "category_name",
+        "categoryName",
+        "status",
+        "leak_type",
+        default=None,
+    )
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("title") or value.get("value")
+    return display(value)
+
+
+def song_era(song):
+    value = first_value(
+        song,
+        "era",
+        "era_name",
+        "eraName",
+        default=None,
+    )
+    return clean_era_display(value) or display(value)
+
+
+def song_producers(song):
+    return display_list(
+        first_value(
+            song,
+            "producers",
+            "producer",
+            "producer_names",
+            "producerNames",
+            default=None,
+        )
+    )
+
+
+def song_engineers(song):
+    return display_list(
+        first_value(
+            song,
+            "engineers",
+            "engineer",
+            "engineer_names",
+            "engineerNames",
+            default=None,
+        )
+    )
+
+
+def song_length(song):
+    value = first_value(
+        song,
+        "length",
+        "duration",
+        "duration_text",
+        "durationText",
+        default=None,
+    )
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes}:{seconds:02d}"
+    return display(value)
+
+
+def song_location(song):
+    value = first_value(
+        song,
+        "recording_locations",
+        "recordingLocations",
+        "recording_location",
+        "recordingLocation",
+        "location",
+        default=None,
+    )
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("location") or value.get("value")
+    return display(value)
+
+
+def song_recorded(song):
+    value = display_list(
+        first_value(
+            song,
+            "record_dates",
+            "recordDates",
+            "recording_dates",
+            "recordingDates",
+            "recording_date",
+            "recordingDate",
+            "recorded",
+            "recorded_date",
+            "recordedDate",
+            default=None,
+        )
+    )
+    if value == "N/A":
+        return value
+    return strip_recorded_prefix(value)
+
+
+def song_alt_names(song):
+    value = display_list(
+        first_value(
+            song,
+            "track_titles",
+            "trackTitles",
+            "alternative_titles",
+            "alternativeTitles",
+            "alternate_titles",
+            "alternateTitles",
+            default=None,
+        )
+    )
+    if value == "N/A":
+        return value
+    title = song_title(song).casefold()
+    parts = [part.strip() for part in value.split(",")]
+    filtered = [part for part in parts if part and part.casefold() != title]
+    return ", ".join(filtered) if filtered else "N/A"
+
+
+def strip_recorded_prefix(value: str) -> str:
+    cleaned = re.sub(
+        r"^recorded[:\s-]*",
+        "",
+        value.strip(),
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned or value
+
+
+def parse_api_json(text: str) -> Any:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    pre_match = re.search(r"<pre[^>]*>(.*?)</pre>", text, re.DOTALL | re.IGNORECASE)
+    if pre_match:
+        inner = html.unescape(pre_match.group(1).strip())
+        try:
+            return json.loads(inner)
+        except Exception:
+            pass
+
+    return None
+
+
+def resolve_cover_url(value):
+    direct = valid_http_url(value)
+    if direct:
+        return direct
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("//"):
+        return f"https:{value}"
+    if value.startswith("/"):
+        return f"https://juicewrldapi.com{value}"
+    if value.startswith(("images/", "media/")):
+        return f"https://juicewrldapi.com/{value}"
+    return None
+
+
+def get_cover_url(song):
+    fields = (
+        "image_url", "imageUrl", "imageURL", "image",
+        "cover_url", "coverUrl", "coverURL",
+        "cover_art_url", "coverArtUrl",
+        "artwork_url", "artworkUrl",
+        "thumbnail_url", "thumbnailUrl", "thumbnail",
+    )
+    for field in fields:
+        value = first_value(song, field, default=None)
+        if isinstance(value, dict):
+            value = get_value(value, "url", "src", "href", "image_url", "imageUrl", default=None)
+        result = resolve_cover_url(value)
+        if result:
+            return result
+    return None
+
+
+def filename_list(song):
+    value = first_value(
+        song,
+        "file_names", "fileNames", "file_name", "fileName", "filename", "files",
+        default=None,
+    )
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [x.strip() for x in value.splitlines() if x.strip()]
+    if isinstance(value, (list, tuple, set)):
+        output = []
+        for item in value:
+            if isinstance(item, dict):
+                item = get_value(
+                    item,
+                    "path", "file_path", "filePath", "filepath",
+                    "filename", "file_name", "fileName", "name",
+                    "url", "download_url", "downloadUrl",
+                    default=None,
+                )
+            if item:
+                output.append(str(item).strip())
+        return output
+    return []
+
+
+def recursive_file_objects(obj):
+    found = []
+    if isinstance(obj, dict):
+        keys = {str(k).casefold() for k in obj.keys()}
+        file_keys = {
+            "path", "file_path", "filepath", "download_path",
+            "download_url", "downloadurl", "stream_url", "streamurl",
+            "play_url", "playurl", "audio_url", "audiourl",
+        }
+        if keys.intersection(file_keys):
+            found.append(obj)
+        for value in obj.values():
+            found.extend(recursive_file_objects(value))
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found.extend(recursive_file_objects(item))
+    return found
+
+
+def file_path_from_item(item):
+    if isinstance(item, str):
+        if item.startswith(("http://", "https://")):
+            return None
+        return normalize_path(item)
+    if not isinstance(item, dict):
+        return None
+    return normalize_path(
+        get_value(
+            item,
+            "path", "file_path", "filePath", "filepath",
+            "download_path", "downloadPath",
+            default=None,
+        )
+    )
+
+
+def direct_file_url(item):
+    if isinstance(item, str):
+        return valid_http_url(item)
+    if not isinstance(item, dict):
+        return None
+    return valid_http_url(
+        get_value(
+            item,
+            "download_url", "downloadUrl", "stream_url", "streamUrl",
+            "play_url", "playUrl", "audio_url", "audioUrl",
+            "url", "href", "link",
+            default=None,
+        )
+    )
+
+
+def build_radio_header(song: Any) -> str:
+    title = song_title(song)
+    lines = [f"### **{title}**"]
+
+    alt_names = song_alt_names(song)
+    if alt_names != "N/A":
+        lines.append(f"-# Alt Name(s): **{alt_names}**")
+
+    engineers = song_engineers(song)
+    if engineers != "N/A":
+        lines.append(f"-# Engineer(s): **{engineers}**")
+
+    producers = song_producers(song)
+    if producers != "N/A":
+        lines.append(f"-# Producer(s): **{producers}**")
+
+    return "\n".join(lines)
+
+
+def build_radio_details(song: Any, player: "RadioPlayer") -> str:
+    fields = []
+
+    era = song_era(song)
+    if era != "N/A":
+        fields.append(f"**Era**\n{era}")
+
+    location = song_location(song)
+    if location != "N/A":
+        fields.append(f"**Recording Location**\n{location}")
+
+    recorded = song_recorded(song)
+    if recorded != "N/A":
+        fields.append(f"**Recorded**\n{recorded}")
+
+    length = song_length(song)
+    if length != "N/A":
+        fields.append(f"**Length**\n{length}")
+
+    category = song_category(song)
+    if category != "N/A":
+        fields.append(f"**Category**\n{category}")
+
+    queue_count = len(player.queue)
+    queue_label = f"{queue_count} song" if queue_count == 1 else f"{queue_count} songs"
+    mode_text = "Paused" if player.paused else "Playing (Shuffle)"
+    loop_text = "On" if player.loop else "Off"
+    fields.append(f"**Radio Status**\n{mode_text} · Loop: {loop_text} · Queue: {queue_label}")
+
+    return "\n\n".join(fields)
+
+
+class JuiceWRLDAPI:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def start(self):
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                headers={"User-Agent": "Timezones-Bot/1.0"},
+            )
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+    async def request(self, endpoint, params=None):
+        await self.start()
+        url = endpoint if endpoint.startswith("http") else f"{API_BASE}/{endpoint.lstrip('/')}"
+        try:
+            async with self.session.get(url, params=params) as response:
+                if response.status != 200:
+                    return None
+                text = await response.text()
+                return parse_api_json(text)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+        except Exception:
+            return None
+
+    async def get_random_song(self) -> dict | None:
+        """Retrieves a true random song across all eras using juicewrldapi's radio endpoint[span_0](start_span)[span_0](end_span)."""
+        for _ in range(12):
+            data = await self.request(RADIO_RANDOM_ENDPOINT)
+            if not data or not isinstance(data, dict):
+                continue
+
+            song_data = data.get("song") if isinstance(data.get("song"), dict) else data
+            era = song_data.get("era", {})
+            era_name = era.get("name", "") if isinstance(era, dict) else str(era)
+
+            if is_post_era(era_name):
+                continue
+
+            if data.get("path") and not song_data.get("path"):
+                song_data["path"] = data["path"]
+            if data.get("title") and not song_data.get("name") and not song_data.get("title"):
+                song_data["title"] = data["title"]
+
+            return song_data
+
+        # Fallback across all 28+ catalog pages instead of sticking to page 1[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
+        try:
+            random_page = random.randint(1, 28)
+            page_data = await self.request(SONGS_ENDPOINT, params={"page": random_page, "page_size": 50})
+            results = self.extract_results(page_data)
+            if results:
+                filtered = [
+                    s for s in results
+                    if not is_post_era(display(unwrap_named(first_value(s, "era", "era_name"))))
+                ]
+                return random.choice(filtered) if filtered else random.choice(results)
+        except Exception:
+            pass
+
+        return None
+
+    async def search_songs(self, query):
+        data = await self.request(
+            SONGS_ENDPOINT,
+            params={
+                "search": query,
+                "page": 1,
+                "page_size": MAX_RESULTS,
+                "limit": MAX_RESULTS,
+            },
+        )
+        return self.extract_results(data)
+
+    async def get_song(self, song_id):
+        endpoint = f"songs/{song_id}/"
+        return await self.request(endpoint)
+
+    async def file_info(self, path):
+        path = normalize_path(path)
+        if not path:
+            return None
+        return await self.request(FILE_INFO_ENDPOINT, params={"path": path})
+
+    async def browse(self, path="", search=None):
+        params = {"path": path}
+        if search:
+            params["search"] = search
+        return await self.request(BROWSE_ENDPOINT, params=params)
+
+    @staticmethod
+    def extract_results(data):
+        if not data:
+            return []
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("results", "songs", "data", "items"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [x for x in value if isinstance(x, dict)]
+        return []
+
+    @staticmethod
+    def extract_items(data):
+        if not data:
+            return []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            value = data.get("items")
+            if isinstance(value, list):
+                return value
+        return []
+
+
+class RadioPlayer:
+    def __init__(self, cog, guild_id):
+        self.cog = cog
+        self.guild_id = guild_id
+        self.voice: Optional[discord.VoiceClient] = None
+        self.current_song = None
+        self.current_url = None
+        self.queue = []
+        self.loop = False
+        self.paused = False
+        self.message = None
+        self.last_song = None
+        self.starting_song = False
+
+    def add_to_queue(self, song):
+        self.queue.append(song)
+
+    def clear_queue(self):
+        self.queue.clear()
+
+    async def get_next_song(self):
+        if self.queue:
+            return self.queue.pop(0)
+        return await self.cog.api.get_random_song()
+
+    async def play_song(self, song):
+        if not self.voice or not self.voice.is_connected():
+            return False
+        self.starting_song = True
+        try:
+            if not song.get("is_custom"):
+                song_id = first_value(
+                    song,
+                    "id", "song_id", "songId", "public_id", "publicId",
+                    default=None,
+                )
+                if song_id is not None:
+                    full_song = await self.cog.api.get_song(song_id)
+                    if isinstance(full_song, dict):
+                        wrapped = full_song.get("song") or full_song.get("data")
+                        if isinstance(wrapped, dict):
+                            if song.get("path") and not wrapped.get("path"):
+                                wrapped["path"] = song["path"]
+                            song = wrapped
+                        else:
+                            song = full_song
+
+            playable = await self.cog.resolve_playable_file(song)
+            if not playable:
+                logger.warning("[Radio] No playable file found for: %s", song_title(song))
+                return False
+
+            play_url = valid_http_url(playable.get("url"))
+            if not play_url:
+                return False
+
+            self.current_song = song
+            self.current_url = play_url
+            self.paused = False
+            source = discord.FFmpegPCMAudio(
+                play_url,
+                before_options=(
+                    "-reconnect 1 "
+                    "-reconnect_streamed 1 "
+                    "-reconnect_delay_max 5 "
+                    "-reconnect_on_network_error 1"
+                ),
+                options="-vn",
+            )
+
+            def after_play(error):
+                asyncio.run_coroutine_threadsafe(
+                    self.song_finished(error),
+                    self.cog.bot.loop,
+                )
+
+            self.voice.play(source, after=after_play)
+            await self.update_message()
+            return True
+        except Exception as exc:
+            logger.exception("[Radio Play Error] %s", exc)
+            return False
+        finally:
+            self.starting_song = False
+
+    async def song_finished(self, error=None):
+        await asyncio.sleep(0.5)
+        if not self.voice or not self.voice.is_connected():
+            return
+        if self.loop and self.current_song:
+            await self.play_song(self.current_song)
+            return
+        next_song = await self.get_next_song()
+        if not next_song:
+            self.current_song = None
+            self.current_url = None
+            await self.update_message()
+            return
+        success = await self.play_song(next_song)
+        if not success:
+            await self.song_finished()
+
+    async def skip(self):
+        if not self.voice:
+            return
+        if not self.voice.is_playing() and not self.voice.is_paused():
+            return
+        self.loop = False
+        self.voice.stop()
+
+    async def pause(self):
+        if self.voice and self.voice.is_playing():
+            self.voice.pause()
+            self.paused = True
+            await self.update_message()
+
+    async def resume(self):
+        if self.voice and self.voice.is_paused():
+            self.voice.resume()
+            self.paused = False
+            await self.update_message()
+
+    async def stop(self):
+        self.loop = False
+        self.clear_queue()
+        self.current_song = None
+        self.current_url = None
+        if self.voice:
+            if self.voice.is_playing() or self.voice.is_paused():
+                self.voice.stop()
+            if self.voice.is_connected():
+                await self.voice.disconnect()
+            self.voice = None
+        await self.update_message()
+
+    async def update_message(self):
+        if not self.message:
+            return
+        try:
+            view = RadioView(self)
+            await self.message.edit(view=view)
+        except Exception as exc:
+            logger.exception("[Radio View Error] %s", exc)
+
+
+class RadioView(discord.ui.LayoutView):
+    def __init__(self, player):
+        super().__init__(timeout=None)
+        song = player.current_song
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+
+        if not song:
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "# Juice WRLD Radio\n"
+                    "-# Nothing is playing right now."
+                )
+            )
+            container.add_item(
+                discord.ui.ActionRow(
+                    RequestButton(player),
+                    UploadButton(player),
+                )
+            )
+            self.add_item(container)
+            return
+
+        cover = get_cover_url(song)
+        header = build_radio_header(song)
+
+        if cover:
+            container.add_item(
+                discord.ui.Section(
+                    discord.ui.TextDisplay(header),
+                    accessory=discord.ui.Thumbnail(media=cover),
+                )
+            )
+        else:
+            container.add_item(discord.ui.TextDisplay(header))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        details = build_radio_details(song, player)
+        if details:
+            container.add_item(discord.ui.TextDisplay(details))
+
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        container.add_item(
+            discord.ui.ActionRow(
+                PreviousButton(player),
+                PauseButton(player),
+                SkipButton(player),
+                LoopButton(player),
+            )
+        )
+        container.add_item(
+            discord.ui.ActionRow(
+                StopButton(player),
+                RequestButton(player),
+                UploadButton(player),
+            )
+        )
+        self.add_item(container)
+
+
+class PreviousButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(label="Previous", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        if self.player.current_song:
+            if self.player.voice:
+                self.player.voice.stop()
+            await self.player.play_song(self.player.current_song)
+
+
+class PauseButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        label = "Resume" if player.paused else "Pause"
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        if self.player.paused:
+            await self.player.resume()
+        else:
+            await self.player.pause()
+
+
+class SkipButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(label="Skip", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        await self.player.skip()
+
+
+class LoopButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(
+            label=f"Loop: {'On' if player.loop else 'Off'}",
+            style=discord.ButtonStyle.secondary,
+        )
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        self.player.loop = not self.player.loop
+        await self.player.update_message()
+
+
+class StopButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(label="Stop", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        await self.player.stop()
+
+
+class RequestModal(discord.ui.Modal, title="Request a Juice WRLD Song"):
+    song = discord.ui.TextInput(
+        label="Song",
+        placeholder="Enter a Juice WRLD song...",
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(self, player):
+        super().__init__()
+        self.player = player
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        query = str(self.song.value).strip()
+        results = await self.player.cog.api.search_songs(query)
+        if not results:
+            await interaction.followup.send(
+                f"Couldn't find **{query}**.",
+                ephemeral=True,
+            )
+            return
+        wanted = query.casefold()
+        selected = None
+        for result in results:
+            if song_title(result).strip().casefold() == wanted:
+                selected = result
+                break
+        if selected is None:
+            selected = results[0]
+        self.player.add_to_queue(selected)
+        await interaction.followup.send(
+            f"🎵 Added **{song_title(selected)}** to the Juice WRLD Radio queue.\n"
+            f"**{len(self.player.queue)}** requested song(s) up next.",
+            ephemeral=True,
+        )
+        if (
+            self.player.voice
+            and not self.player.voice.is_playing()
+            and not self.player.voice.is_paused()
+        ):
+            next_song = await self.player.get_next_song()
+            if next_song:
+                await self.player.play_song(next_song)
+        await self.player.update_message()
+
+
+class RequestButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(
+            label="Request",
+            emoji="🎵",
+            style=discord.ButtonStyle.secondary,
+        )
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(RequestModal(self.player))
+
+
+class UploadButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(
+            label="Upload MP3",
+            emoji="📁",
+            style=discord.ButtonStyle.secondary,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "📤 Please upload your audio file (`.mp3`, `.wav`, `.m4a`, etc.) in this channel within 60 seconds.",
+            ephemeral=True,
+        )
+
+        def check(m: discord.Message):
+            return (
+                m.author.id == interaction.user.id
+                and m.channel.id == interaction.channel.id
+                and len(m.attachments) > 0
+            )
+
+        try:
+            msg = await self.player.cog.bot.wait_for("message", timeout=60.0, check=check)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⏱️ Upload timed out.", ephemeral=True)
+            return
+
+        attachment = msg.attachments[0]
+        valid_exts = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
+        if not attachment.filename.lower().endswith(valid_exts):
+            await interaction.followup.send(
+                "❌ Invalid format. Please upload an audio file (`.mp3`, `.wav`, etc.).",
+                ephemeral=True,
+            )
+            return
+
+        base_name = attachment.filename.rsplit(".", 1)[0]
+        custom_song = {
+            "is_custom": True,
+            "title": base_name,
+            "name": base_name,
+            "url": attachment.url,
+            "era": "Uploaded Audio",
+            "category": "Custom",
+        }
+
+        self.player.add_to_queue(custom_song)
+        await interaction.followup.send(
+            f"🎵 Added **{custom_song['title']}** to the radio queue.\n"
+            f"**{len(self.player.queue)}** song(s) up next.",
+            ephemeral=True,
+        )
+
+        try:
+            await msg.delete()
+        except discord.DiscordException:
+            pass
+
+        if (
+            self.player.voice
+            and not self.player.voice.is_playing()
+            and not self.player.voice.is_paused()
+        ):
+            next_song = await self.player.get_next_song()
+            if next_song:
+                await self.player.play_song(next_song)
+
+        await self.player.update_message()
+
+
+class Radio(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.api = JuiceWRLDAPI()
+        self.players = {}
+
+    def get_player(self, guild_id):
+        if guild_id not in self.players:
+            self.players[guild_id] = RadioPlayer(self, guild_id)
+        return self.players[guild_id]
+
+    async def resolve_playable_file(self, song):
+        if song.get("is_custom"):
+            return {
+                "url": song.get("url"),
+                "name": song.get("title", "Uploaded Song"),
+            }
+
+        if song.get("path"):
+            path = normalize_path(song["path"])
+            if path:
+                return {"url": make_download_url(path), "name": song_title(song)}
+
+        candidates = []
+        for item in recursive_file_objects(song):
+            candidates.append(item)
+        for filename in filename_list(song):
+            candidates.append(filename)
+
+        seen = set()
+        for candidate in candidates:
+            direct = direct_file_url(candidate)
+            if direct:
+                identity = direct.casefold()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                return {"url": direct, "name": song_title(song)}
+
+            path = file_path_from_item(candidate)
+            if not path:
+                continue
+
+            identity = path.casefold()
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            info = await self.api.file_info(path)
+            if not info:
+                continue
+
+            info_path = normalize_path(
+                first_value(
+                    info,
+                    "path", "file_path", "filePath", "filepath",
+                    default=path,
+                )
+            ) or path
+
+            stream_url = valid_http_url(
+                first_value(
+                    info,
+                    "stream_url", "streamUrl", "play_url", "playUrl",
+                    "audio_url", "audioUrl", "download_url", "downloadUrl",
+                    "url", "href",
+                    default=None,
+                )
+            ) or make_download_url(info_path)
+
+            if stream_url:
+                return {
+                    "url": stream_url,
+                    "name": display(
+                        first_value(
+                            info,
+                            "name", "filename", "file_name", "fileName",
+                            default=song_title(song),
+                        ),
+                        song_title(song),
+                    ),
+                }
+
+        title = song_title(song)
+        browse_data = await self.api.browse(path="", search=title)
+        items = self.api.extract_items(browse_data)
+        file_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).casefold()
+            path = file_path_from_item(item)
+            name = display(
+                get_value(
+                    item,
+                    "name", "filename", "file_name", "fileName", "title",
+                    default="",
+                ),
+                "",
+            )
+            if path and (item_type in ("file", "audio") or "." in path.split("/")[-1]):
+                file_items.append((name, path))
+
+        file_items.sort(key=lambda x: (not title_matches(title, x[0]), len(x[1])))
+        for name, path in file_items:
+            if not title_matches(title, name):
+                continue
+            url = make_download_url(path)
+            if url:
+                return {"url": url, "name": name or title}
+
+        return None
+
+    @commands.command(name="radio", aliases=["rd", "wrldradio"])
+    async def radio(self, ctx):
+        if not ctx.author.voice:
+            view = discord.ui.LayoutView(timeout=60)
+            container = discord.ui.Container(accent_color=EMBED_COLOR)
+            container.add_item(
+                discord.ui.TextDisplay("❌ You need to be in a voice channel first.")
+            )
+            view.add_item(container)
+            return await ctx.send(view=view)
+
+        channel = ctx.author.voice.channel
+        player = self.get_player(ctx.guild.id)
+
+        try:
+            if player.voice:
+                if (
+                    player.voice.is_connected()
+                    and player.voice.channel.id != channel.id
+                ):
+                    await player.voice.move_to(channel)
+            else:
+                player.voice = await channel.connect()
+        except Exception as exc:
+            logger.exception("[Radio Voice Connect Error] %s", exc)
+            view = discord.ui.LayoutView(timeout=60)
+            container = discord.ui.Container(accent_color=EMBED_COLOR)
+            container.add_item(discord.ui.TextDisplay("❌ Could not connect to your voice channel."))
+            view.add_item(container)
+            return await ctx.send(view=view)
+
+        if player.voice.is_playing() or player.voice.is_paused():
+            view = RadioView(player)
+            message = await ctx.send(view=view)
+            player.message = message
+            return
+
+        song = await player.get_next_song()
+        if not song:
+            view = discord.ui.LayoutView(timeout=60)
+            container = discord.ui.Container(accent_color=EMBED_COLOR)
+            container.add_item(
+                discord.ui.TextDisplay("❌ I couldn't find any songs in the Juice WRLD API.")
+            )
+            view.add_item(container)
+            return await ctx.send(view=view)
+
+        view = RadioView(player)
+        message = await ctx.send(view=view)
+        player.message = message
+        success = await player.play_song(song)
+        if not success:
+            error_view = discord.ui.LayoutView(timeout=60)
+            container = discord.ui.Container(accent_color=EMBED_COLOR)
+            container.add_item(
+                discord.ui.TextDisplay("❌ I couldn't find a playable audio file for the selected song.")
+            )
+            error_view.add_item(container)
+            await message.edit(view=error_view)
+
+    def cog_unload(self):
+        asyncio.create_task(self.api.close())
+        for player in self.players.values():
+            if player.voice:
+                asyncio.create_task(player.voice.disconnect())
+
+
+async def setup(bot):
+    await bot.add_cog(Radio(bot))
