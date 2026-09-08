@@ -31,7 +31,7 @@ class TTS(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.client = ElevenLabs(api_key="sk_41147006a675b4747976e76e16b4ac552ac034ad4a3dfaaa  YDCfZMLWcUmsGvqHq0rS")
+        self.client = ElevenLabs(api_key="sk_369e4e780fc704eca99a335905cfc1be77c07f784a14b1c7")
 
     async def send_error(self, ctx: commands.Context, message: str) -> None:
         await ctx.send(view=simple_view(message))
