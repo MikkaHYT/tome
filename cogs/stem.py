@@ -6,11 +6,11 @@ import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 import discord
-from curl_cffi.requests import AsyncSession
 from discord.ext import commands
 
 try:
@@ -21,21 +21,21 @@ except ImportError:
 logger = logging.getLogger("juicevault.stems")
 
 JUICEVAULT_BASE = "https://api.juicevault.xyz"
-STEMS_LIST_ENDPOINT = f"{JUICEVAULT_BASE}/music/stems/list"
 DOWNLOAD_ENDPOINT = f"{JUICEVAULT_BASE}/music/download"
 
-API_TIMEOUT = 25
 CACHE_TTL = 1800
 SELECT_TIMEOUT = 120
 VIEW_TIMEOUT = 900
 MAX_META_LENGTH = 90
 
-HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://juicevault.xyz/",
-    "Origin": "https://juicevault.xyz",
-}
+
+def get_stems_file_path() -> Path:
+    # Looks one level up from the current file's folder (i.e. ../stems.json)
+    parent_path = Path(__file__).resolve().parent.parent / "stems.json"
+    if parent_path.is_file():
+        return parent_path
+    # Fallback to current working directory
+    return Path.cwd() / "stems.json"
 
 
 def clean_match_key(value: str) -> str:
@@ -258,13 +258,13 @@ class StemSelect(discord.ui.Select):
 
         await interaction.response.defer()
         chosen = self.candidates[int(self.values[0])]
-        logger.info("[StemSelect] User picked: %s (id=%s)", chosen.get("title"), chosen.get("id"))
+        logger.info("[StemSelect] Selected: %s (ID: %s)", chosen.get("title"), chosen.get("id"))
 
         try:
             view = StemView(chosen)
             await interaction.edit_original_response(view=view)
         except discord.HTTPException:
-            logger.exception("[StemSelect] Discord rejected layout view.")
+            logger.exception("[StemSelect] Layout view rejected.")
             await self.cog.edit_with_error(interaction, "❌ Discord rejected the stem card.")
         except Exception:
             logger.exception("[StemSelect] Failed to render selected stem.")
@@ -299,22 +299,16 @@ class StemSelectView(discord.ui.LayoutView):
             pass
 
 
-class JuiceVaultAPI:
+class JuiceVaultManager:
     def __init__(self) -> None:
-        self.session: Optional[AsyncSession] = None
         self._stems_cache: list[dict[str, Any]] = []
         self._cache_timestamp: float = 0
         self._cache_lock = asyncio.Lock()
 
-    async def get_session(self) -> AsyncSession:
-        if self.session is None:
-            self.session = AsyncSession(impersonate="chrome124", timeout=API_TIMEOUT)
-        return self.session
-
-    async def close(self) -> None:
-        if self.session:
-            await self.session.close()
-            self.session = None
+    @staticmethod
+    def _read_file_sync(path: Path) -> Any:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     @staticmethod
     def extract_results(data: Any) -> list[dict[str, Any]]:
@@ -341,40 +335,30 @@ class JuiceVaultAPI:
             if not force and self._stems_cache and (now - self._cache_timestamp < CACHE_TTL):
                 return self._stems_cache
 
-            logger.info("[JuiceVault] Fetching stems list with browser impersonation: %s", STEMS_LIST_ENDPOINT)
-            session = await self.get_session()
+            path = get_stems_file_path()
+            logger.info("[JuiceVault] Loading stems from disk: %s", path)
+
+            if not path.is_file():
+                logger.error("[JuiceVault] Local stems.json file does not exist at: %s", path)
+                return self._stems_cache
+
             try:
-                resp = await session.get(STEMS_LIST_ENDPOINT, headers=HEADERS)
-                logger.info(
-                    "[JuiceVault] Response status: %d | Body size: %d bytes",
-                    resp.status_code,
-                    len(resp.content),
-                )
-
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = json.loads(resp.text)
-
-                    stems = self.extract_results(data)
-                    if stems:
-                        self._stems_cache = stems
-                        self._cache_timestamp = now
-                        logger.info("[JuiceVault] Successfully indexed %d stems.", len(stems))
-                    else:
-                        logger.warning("[JuiceVault] 200 OK returned but 0 items extracted.")
+                data = await asyncio.to_thread(self._read_file_sync, path)
+                stems = self.extract_results(data)
+                if stems:
+                    self._stems_cache = stems
+                    self._cache_timestamp = now
+                    logger.info("[JuiceVault] Successfully loaded %d stems from %s", len(stems), path.name)
                 else:
-                    logger.error("[JuiceVault] Request failed with HTTP %d: %s", resp.status_code, resp.text[:250])
+                    logger.warning("[JuiceVault] %s parsed successfully but yielded 0 items.", path.name)
             except Exception as e:
-                logger.exception("[JuiceVault] Request exception during indexing: %s", e)
+                logger.exception("[JuiceVault] Failed to parse %s: %s", path, e)
 
         return self._stems_cache
 
     async def search_stems(self, query: str) -> list[dict[str, Any]]:
         stems = await self._ensure_stems_index()
         if not stems:
-            logger.warning("[JuiceVault] Cache empty. Retrying fetch...")
             stems = await self._ensure_stems_index(force=True)
             if not stems:
                 return []
@@ -442,7 +426,6 @@ class JuiceVaultAPI:
                 fuzzy_matches.append((best_score, stem))
 
         if exact_matches:
-            logger.info("[JuiceVault] %d exact matches found for '%s'", len(exact_matches), query)
             return exact_matches[:25]
 
         fuzzy_matches.sort(key=lambda x: x[0], reverse=True)
@@ -458,21 +441,13 @@ class JuiceVaultAPI:
                     seen_ids.add(s_id)
                     combined.append(s)
 
-        logger.info(
-            "[JuiceVault] Search returned %d candidates for query '%s'",
-            len(combined[:25]),
-            query,
-        )
         return combined[:25]
 
 
 class Stem(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.api = JuiceVaultAPI()
-
-    def cog_unload(self) -> None:
-        asyncio.create_task(self.api.close())
+        self.manager = JuiceVaultManager()
 
     async def send_error(self, ctx: commands.Context, message: str) -> None:
         await ctx.send(view=simple_view(message))
@@ -500,7 +475,7 @@ class Stem(commands.Cog):
 
         searching_msg = await ctx.send(view=simple_view(f"🔍 Searching JuiceVault stems for **{query}**..."))
 
-        results = await self.api.search_stems(query)
+        results = await self.manager.search_stems(query)
         if not results:
             await searching_msg.edit(
                 view=simple_view(f"❌ Couldn't find any stems matching **{query}**.")
