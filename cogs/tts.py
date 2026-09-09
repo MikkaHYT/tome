@@ -5,17 +5,17 @@ from __future__ import annotations
 import io
 import logging
 
+import aiohttp
 import discord
 from discord.ext import commands
-from elevenlabs.client import ElevenLabs
 
 from config import EMBED_COLOR
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "eleven_v3"
-OUTPUT_FORMAT = "mp3_44100_128"
-MAX_CHARS = 1000  # keep requests reasonable / avoid abuse 
+FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+FISH_MODEL = "s2.1-pro-free"  # free tier model for testing/prototyping
+MAX_CHARS = 1000  # keep requests reasonable / avoid abuse
 
 
 def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
@@ -27,20 +27,27 @@ def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
 
 
 class TTS(commands.Cog):
-    """ElevenLabs text-to-speech command."""
+    """Fish Audio text-to-speech command."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.client = ElevenLabs(api_key="sk_369e4e780fc704eca99a335905cfc1be77c07f784a14b1c7")
+        self.session: aiohttp.ClientSession | None = None
+
+    async def cog_load(self) -> None:
+        self.session = aiohttp.ClientSession()
+
+    async def cog_unload(self) -> None:
+        if self.session:
+            await self.session.close()
 
     async def send_error(self, ctx: commands.Context, message: str) -> None:
         await ctx.send(view=simple_view(message))
 
     @commands.command(
         name="tts",
-        description="Converts text to speech using ElevenLabs and sends it as an mp3.",
+        description="Converts text to speech using Fish Audio and sends it as an mp3.",
         help="Generates a spoken mp3 of the given text.",
-        extras={"example": "tts The first move is what sets everything in motion."},
+        extras={"example": "tts Hello! Welcome to Fish Audio."},
     )
     async def tts(self, ctx: commands.Context, *, text: str | None = None) -> None:
         if not text:
@@ -49,7 +56,7 @@ class TTS(commands.Cog):
                 "**Syntax**\n"
                 "`,tts <text>`\n\n"
                 "**Example**\n"
-                "`,tts The first move is what sets everything in motion.`"
+                "`,tts Hello! Welcome to Fish Audio.`"
             )
             await ctx.send(view=help_view)
             return
@@ -60,34 +67,45 @@ class TTS(commands.Cog):
             )
             return
 
+        
         async with ctx.typing():
             try:
-                audio = await self.bot.loop.run_in_executor(
-                    None,
-                    lambda: self.client.text_to_speech.convert(
-                        text=text,
-                        voice_id="JBFqnCBsd6RMkjVDRZzb",
-                        model_id=MODEL_ID,
-                        output_format=OUTPUT_FORMAT,
-                    ),
-                )
-                # convert() returns a generator of audio chunks - collect them
-                buffer = io.BytesIO()
-                for chunk in audio:
-                    if chunk:
-                        buffer.write(chunk)
-                buffer.seek(0)
-            except Exception:
-                logger.exception("ElevenLabs TTS request failed")
+                assert self.session is not None
+                async with self.session.post(
+                    FISH_TTS_URL,
+                    headers={
+                        "Authorization": f"Bearer sk-fish-JlQ51EW0V2ffREBG6fRzVD0us0bUHj6RqLAbq9ew-jQ",
+                        "Content-Type": "application/json",
+                        "model": FISH_MODEL,
+                    },
+                    json={
+                        "text": text,
+                        "reference_id": "6ea3c15f427e402399022da1c96f0b70",
+                        "format": "mp3",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(
+                            "Fish Audio TTS request failed (%s): %s",
+                            resp.status,
+                            body[:500],
+                        )
+                        await self.send_error(ctx, "❌ Failed to generate speech.")
+                        return
+
+                    data = await resp.read()
+            except aiohttp.ClientError:
+                logger.exception("Fish Audio TTS request failed")
                 await self.send_error(ctx, "❌ Failed to generate speech.")
                 return
 
-        if buffer.getbuffer().nbytes == 0:
-            await self.send_error(ctx, "❌ ElevenLabs returned no audio.")
+        if not data:
+            await self.send_error(ctx, "❌ Fish Audio returned no audio.")
             return
 
         try:
-            await ctx.send(file=discord.File(buffer, filename="tts.mp3"))
+            await ctx.send(file=discord.File(io.BytesIO(data), filename="tts.mp3"))
         except discord.HTTPException:
             logger.exception("Discord rejected the tts audio file")
             await self.send_error(ctx, "❌ Discord rejected the audio file.")
