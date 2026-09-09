@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
@@ -29,6 +30,8 @@ MAX_RESULTS = 25
 EMBED_COLOR = discord.Color.from_str("#2b2d31")
 
 RADIO_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "radio_settings.json"
+UPLOADS_DIR = Path(__file__).resolve().parent.parent / "radio_uploads"
+UPLOADS_META_PATH = Path(__file__).resolve().parent.parent / "radio_uploads.json"
 
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
 
@@ -706,6 +709,7 @@ class RadioPlayer:
         self.last_song = None
         self._advance_lock = asyncio.Lock()
         self._skip_requested = False
+        self.history = []
 
     def add_to_queue(self, song):
         self.queue.append(song)
@@ -742,7 +746,7 @@ class RadioPlayer:
                     return
             await self.update_message()
 
-    async def play_song(self, song):
+    async def play_song(self, song, push_history=True):
         if not self.voice or not self.voice.is_connected():
             return False
         try:
@@ -768,10 +772,13 @@ class RadioPlayer:
                 logger.warning("[Radio] No playable file found for: %s", song_title(song))
                 return False
 
-            play_url = valid_http_url(playable.get("url"))
+            play_url = playable.get("url")
             if not play_url:
                 return False
+            if not (valid_http_url(play_url) or Path(play_url).is_file()):
+                return False
 
+            previous_song = self.current_song
             self.current_song = song
             self.current_url = play_url
             self.paused = False
@@ -793,6 +800,10 @@ class RadioPlayer:
                 )
 
             self.voice.play(source, after=after_play)
+            if push_history and previous_song is not None and previous_song is not song:
+                self.history.append(previous_song)
+                if len(self.history) > 50:
+                    self.history.pop(0)
             await self.update_message()
             return True
         except Exception as exc:
@@ -812,6 +823,21 @@ class RadioPlayer:
             return
         self._skip_requested = True
         self.voice.stop()
+
+    async def previous(self):
+        """Go back to the last played track (works for API songs and uploads)."""
+        if not self.history:
+            return
+        previous_song = self.history.pop()
+        self._skip_requested = True
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            if self.voice.is_paused():
+                self.voice.resume()
+            self.voice.stop()
+        async with self._advance_lock:
+            played = await self.play_song(previous_song, push_history=False)
+            if played:
+                self._skip_requested = False
 
     async def play(self):
         """Resume a paused stream, or start the next track if idle."""
@@ -876,6 +902,7 @@ class RadioView(discord.ui.LayoutView):
             container.add_item(small_separator())
             container.add_item(
                 discord.ui.ActionRow(
+                    PreviousButton(player),
                     PlayButton(player),
                     PauseButton(player),
                     NextButton(player),
@@ -908,12 +935,20 @@ class RadioView(discord.ui.LayoutView):
 
         container.add_item(
             discord.ui.ActionRow(
+                PreviousButton(player),
                 PlayButton(player),
                 PauseButton(player),
                 NextButton(player),
                 LoopButton(player),
             )
         )
+
+        uploads = player.cog.get_uploads(player.guild_id)
+        if uploads:
+            container.add_item(
+                discord.ui.ActionRow(UploadsSelect(uploads, player))
+            )
+
         container.add_item(text_display(QUEUE_HINT))
         self.add_item(container)
 
@@ -978,6 +1013,79 @@ class LoopButton(discord.ui.Button):
     async def callback(self, interaction):
         await interaction.response.defer()
         self.player.loop = not self.player.loop
+        await self.player.update_message()
+
+
+class PreviousButton(discord.ui.Button):
+    def __init__(self, player):
+        self.player = player
+        super().__init__(
+            emoji="⏮️",
+            style=discord.ButtonStyle.secondary,
+            disabled=not player.history,
+            custom_id="radio_previous",
+        )
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        await self.player.previous()
+
+
+class UploadsSelect(discord.ui.Select):
+    def __init__(self, uploads: list[dict], player: RadioPlayer):
+        self.player = player
+        self.uploads = uploads
+
+        options = []
+        for upload in uploads[:25]:
+            label = upload.get("original_name") or upload.get("filename") or "Unknown"
+            uploader = upload.get("uploader_name") or "Unknown"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(upload.get("filename")),
+                    description=f"Uploaded by {uploader}"[:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="🎵 Play a previously uploaded MP3...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        filename = self.values[0]
+        upload = next(
+            (u for u in self.uploads if u.get("filename") == filename),
+            None,
+        )
+        if upload is None:
+            return
+
+        local_path = UPLOADS_DIR / filename
+        if not local_path.is_file():
+            await interaction.followup.send(
+                "❌ That file is no longer available on disk.",
+                ephemeral=True,
+            )
+            return
+
+        base_name = Path(filename).stem.replace("_", " ")
+        song = {
+            "is_custom": True,
+            "title": base_name,
+            "name": base_name,
+            "filename": filename,
+            "local_path": str(local_path),
+            "era": "Uploaded Audio",
+            "category": "Custom",
+            "uploader_name": upload.get("uploader_name"),
+        }
+        self.player.add_to_queue(song)
+        await self.player._advance()
         await self.player.update_message()
 
 
@@ -1066,6 +1174,7 @@ class Radio(commands.Cog):
         self.api = JuiceWRLDAPI()
         self.players = {}
         self._settings = self._load_settings()
+        self._uploads = self._load_uploads()
         self._ready_done = False
 
     # ------------------------------------------------------------------
@@ -1090,6 +1199,79 @@ class Radio(commands.Cog):
             os.replace(tmp, RADIO_SETTINGS_PATH)
         except Exception:
             logger.exception("[Radio] Could not save radio settings")
+
+    # ------------------------------------------------------------------
+    # Uploaded MP3 persistence
+    # ------------------------------------------------------------------
+
+    def _load_uploads(self) -> dict:
+        try:
+            with open(UPLOADS_META_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_uploads(self):
+        tmp = UPLOADS_META_PATH.with_suffix(".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._uploads, f, indent=2)
+            os.replace(tmp, UPLOADS_META_PATH)
+        except Exception:
+            logger.exception("[Radio] Could not save upload metadata")
+
+    def get_uploads(self, guild_id: int) -> list[dict]:
+        entries = self._uploads.get(str(guild_id)) or []
+        if not isinstance(entries, list):
+            return []
+        return [
+            upload
+            for upload in entries
+            if isinstance(upload, dict)
+            and upload.get("filename")
+            and (UPLOADS_DIR / upload["filename"]).is_file()
+        ]
+
+    def add_upload(self, guild_id, filename, original_name, uploader_id, uploader_name):
+        entry = {
+            "filename": filename,
+            "original_name": original_name,
+            "uploader_id": uploader_id,
+            "uploader_name": uploader_name,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        entries = self._uploads.setdefault(str(guild_id), [])
+        if not isinstance(entries, list):
+            entries = []
+        entries = [u for u in entries if u.get("filename") != filename]
+        entries.append(entry)
+        self._uploads[str(guild_id)] = entries
+        self._save_uploads()
+
+    async def download_attachment(self, attachment) -> Path | None:
+        try:
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            filename = Path(attachment.filename).name or "audio.mp3"
+            dest = UPLOADS_DIR / filename
+            stem, suffix = dest.stem, dest.suffix
+            counter = 2
+            while dest.exists():
+                dest = UPLOADS_DIR / f"{stem} ({counter}){suffix}"
+                counter += 1
+
+            await self.api.start()
+            async with self.api.session.get(attachment.url) as response:
+                if response.status != 200:
+                    return None
+                data = await response.read()
+            dest.write_bytes(data)
+            return dest
+        except Exception:
+            logger.exception("[Radio] Could not download uploaded audio")
+            return None
 
     def set_radio_channel(self, guild_id: int, channel_id: int):
         key = str(guild_id)
@@ -1137,6 +1319,12 @@ class Radio(commands.Cog):
 
     async def resolve_playable_file(self, song):
         if song.get("is_custom"):
+            local_path = song.get("local_path")
+            if local_path and Path(local_path).is_file():
+                return {
+                    "url": str(local_path),
+                    "name": song.get("title", "Uploaded Song"),
+                }
             return {
                 "url": song.get("url"),
                 "name": song.get("title", "Uploaded Song"),
@@ -1358,14 +1546,26 @@ class Radio(commands.Cog):
 
         if audio:
             attachment = audio[0]
+            saved = await self.download_attachment(attachment)
+            if saved is not None:
+                self.add_upload(
+                    message.guild.id,
+                    filename=saved.name,
+                    original_name=attachment.filename,
+                    uploader_id=message.author.id,
+                    uploader_name=message.author.display_name,
+                )
             base_name = attachment.filename.rsplit(".", 1)[0].replace("_", " ")
             custom_song = {
                 "is_custom": True,
                 "title": base_name,
                 "name": base_name,
                 "url": attachment.url,
+                "filename": (saved or Path(attachment.filename)).name,
+                "local_path": str(saved) if saved is not None else None,
                 "era": "Uploaded Audio",
                 "category": "Custom",
+                "uploader_name": message.author.display_name,
             }
             player.add_to_queue(custom_song)
             await self._try_delete(message)

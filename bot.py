@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -16,6 +17,7 @@ from utils.core import Database, HTTP, ParameterParser, SendHelp, is_guild_owner
 from utils.core.cache import BotCache
 from utils.core.context import Context
 from utils.core.errors import send_command_error, send_usage_help, USAGE_ERRORS
+from utils.core.slash_bridge import bridge_bot, handle_application_error
 
 ROOT = Path(__file__).resolve().parent
 COGS_DIR = ROOT / "cogs"
@@ -38,6 +40,16 @@ logger = logging.getLogger("timezones")
 OWNER_IDS = {217389696043450368, 1354629588965134376}  
 
 
+class TimezonesCommandTree(app_commands.CommandTree):
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        await handle_application_error(interaction, error)
+
+
 class TimezonesBot(commands.Bot):
 
     def __init__(self) -> None:
@@ -50,6 +62,7 @@ class TimezonesBot(commands.Bot):
             intents=intents,
             help_command=None,
             owner_ids=OWNER_IDS,
+            tree_cls=TimezonesCommandTree,
             activity=discord.CustomActivity(name=".gg/timezones"),
             status=discord.Status.online,
         )
@@ -84,6 +97,7 @@ class TimezonesBot(commands.Bot):
         await self.cache.initialize_settings_cache()
         self.before_invoke(self._before_command)
         await self._load_cogs()
+        bridge_bot(self)
         await self._sync_commands()
 
     async def close(self) -> None:
@@ -116,6 +130,15 @@ class TimezonesBot(commands.Bot):
                 logger.info("Loaded %s", extension)
             except Exception:
                 logger.exception("Failed to load %s", extension)
+
+        # ``@commands.command(parameters={...})`` declares custom ``--flag``
+        # options, but discord.py never attaches them to the command object.
+        # Expose them on ``command.parameters`` so the flag parser in
+        # ``_before_command`` and the slash bridge can both read them.
+        for command in self.walk_commands():
+            config = command.__original_kwargs__.get("parameters")
+            if config and not hasattr(command, "parameters"):
+                command.parameters = config
 
         logger.info("Cog load complete (%d loaded)", loaded)
 

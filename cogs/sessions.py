@@ -913,6 +913,9 @@ class SessionAPI:
 
             name = item.get("name", "")
 
+            if not _name_matches_song(name, target_keys):
+                continue
+
             seen_paths.add(path)
             download_url = make_download_url(path)
             file_entry = {
