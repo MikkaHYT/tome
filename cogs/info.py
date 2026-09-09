@@ -8,6 +8,7 @@ from time import time
 
 import discord
 import psutil
+from discord import app_commands
 from discord.ext import commands
 
 from config import EMBED_COLOR, PING_RESPONSES
@@ -183,6 +184,34 @@ class Info(commands.Cog):
             total_lines=total_lines,
         )
         await ctx.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="ping", description="Show bot latency")
+    async def ping_slash(self, interaction: discord.Interaction) -> None:
+        started = time()
+        await interaction.response.send_message(content="..")
+        finished = time() - started
+        await interaction.edit_original_response(
+            content=(
+                f"it took `{int(self.bot.latency * 1000)}ms` to ping "
+                f"**{choice(PING_RESPONSES)}** (edit: `{finished:.2f}ms`)"
+            )
+        )
+
+    @app_commands.command(name="botinfo", description="Show bot information")
+    async def botinfo_slash(self, interaction: discord.Interaction) -> None:
+        total_users = sum(g.member_count or 0 for g in self.bot.guilds)
+        total_servers = len(self.bot.guilds)
+        total_commands = _count_commands(list(self.bot.commands))
+        total_lines = _count_lines()
+
+        view = build_botinfo_view(
+            self.bot,
+            total_users=total_users,
+            total_servers=total_servers,
+            total_commands=total_commands,
+            total_lines=total_lines,
+        )
+        await interaction.response.send_message(view=view)
 
 
 async def setup(bot: commands.Bot) -> None:

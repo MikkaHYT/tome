@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 try:
@@ -961,6 +962,71 @@ class MakeSnip(commands.Cog):
             return
         logger.exception("[MakeSnip] Unhandled command error: %s", error)
         await ctx.send(f"❌ **MakeSnip error:** `{error}`")
+
+    @app_commands.command(name="makesnip", description="Create a 30-second video snippet of a Juice WRLD track")
+    @app_commands.describe(query="Song title to search for")
+    async def makesnip_slash(
+        self,
+        interaction: discord.Interaction,
+        query: str | None = None,
+    ) -> None:
+        if not query:
+            help_view = simple_view(
+                "# Command: makesnip\n\n"
+                "**Syntax**\n"
+                "`,makesnip <song>`\n\n"
+                "**Example**\n"
+                "`,makesnip rental`"
+            )
+            await interaction.response.send_message(view=help_view)
+            return
+
+        await interaction.response.send_message(
+            view=simple_view(f"🔍 Searching song for **{query}**...")
+        )
+
+        results = await self.api.search_songs(query)
+        if not results:
+            await interaction.edit_original_response(
+                view=simple_view(f"❌ Couldn't find a song matching **{query}**.")
+            )
+            return
+
+        wanted = clean_match_key(query)
+        exact_match = next(
+            (r for r in results if clean_match_key(get_song_title(r)) == wanted),
+            None,
+        )
+
+        if len(results) == 1 or exact_match is not None:
+            chosen = exact_match or results[0]
+            await self.process_and_send_snippet(interaction, chosen)
+            return
+
+        dropdown_view = MakeSnipSelectView(
+            query=query,
+            candidates=results[:MAX_RESULTS],
+            author_id=interaction.user.id,
+            cog=self,
+        )
+        msg = await interaction.edit_original_response(view=dropdown_view)
+        dropdown_view.message = msg
+
+    @makesnip_slash.error
+    async def makesnip_slash_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        logger.exception("[MakeSnip] Slash command error: %s", error)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"❌ **MakeSnip error:** `{error}`", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **MakeSnip error:** `{error}`", ephemeral=True
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

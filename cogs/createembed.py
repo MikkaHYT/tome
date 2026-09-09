@@ -729,7 +729,7 @@ class CreateEmbed(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @commands.command(name="createembed", aliases=["embedbuilder", "buildembed"])
+    @commands.command(name="createembed", aliases=["embedbuilder", "buildembed", "ce"])
     @commands.has_permissions(manage_messages=True)
     async def createembed(self, ctx: commands.Context) -> None:
         if ctx.guild is None:

@@ -649,9 +649,21 @@ class CrashActiveView(discord.ui.LayoutView):
     def __init__(self, players: dict[int, dict[str, Any]]):
         super().__init__(timeout=180)
         self.players = players
+        self.start_time = time.monotonic()
         self.current_mult = 1.00
         self.all_done = False
         self._render()
+
+    def _multiplier_at(self, elapsed: float) -> float:
+        # Continuous form of the old tick loop ``mult += 0.15 + mult * 0.05``
+        # every 0.9s, so the displayed multiplier always matches wall-clock
+        # time instead of only updating on each render tick.
+        mult = 4.0 * math.exp(0.0555555556 * elapsed) - 3.0
+        return round(min(mult, 100.0), 2)
+
+    def tick(self) -> float:
+        self.current_mult = self._multiplier_at(time.monotonic() - self.start_time)
+        return self.current_mult
 
     def _render(self):
         self.clear_items()
@@ -660,11 +672,21 @@ class CrashActiveView(discord.ui.LayoutView):
         player_status = []
         for uid, p in self.players.items():
             if p["cashed_out"]:
-                player_status.append(f"✅ **{p['name']}**: Cashed out at **x{p['cash_mult']:.2f}** (+{format_cash_short(p['winnings'])}) · Potential: x{p['crash_point']:.2f}")
+                player_status.append(
+                    f"✅ **{p['name']}**: Cashed out at **x{p['cash_mult']:.2f}** "
+                    f"(+{format_cash_short(p['winnings'])})"
+                )
             elif self.current_mult >= p["crash_point"]:
-                player_status.append(f"💥 **{p['name']}**: Crashed at **x{p['crash_point']:.2f}**! (-{format_cash_short(p['bet'])})")
+                player_status.append(
+                    f"💥 **{p['name']}**: Crashed at **x{p['crash_point']:.2f}**! "
+                    f"(-{format_cash_short(p['bet'])})"
+                )
             else:
-                player_status.append(f"🟢 **{p['name']}**: In Play ({format_cash_short(p['bet'])})")
+                potential = int(p["bet"] * self.current_mult)
+                player_status.append(
+                    f"🟢 **{p['name']}**: Bet {format_cash_short(p['bet'])} · "
+                    f"Potential: 🪙 **{format_cash_short(potential)}** (x{self.current_mult:.2f})"
+                )
 
         container.add_item(
             text_display(
@@ -681,7 +703,14 @@ class CrashActiveView(discord.ui.LayoutView):
 
 class CrashCashoutButton(discord.ui.Button):
     def __init__(self, active_view: CrashActiveView):
-        super().__init__(label="💰 Cashout Now", style=discord.ButtonStyle.success)
+        # Fixed custom_id: the view is re-rendered every tick, and without a
+        # stable id each render mints a new component, so clicks landing
+        # between renders fail with "This interaction failed".
+        super().__init__(
+            label="💰 Cashout Now",
+            style=discord.ButtonStyle.success,
+            custom_id="crash_cashout",
+        )
         self.active_view = active_view
 
     async def callback(self, interaction: discord.Interaction):
@@ -692,12 +721,17 @@ class CrashCashoutButton(discord.ui.Button):
         p = self.active_view.players[uid]
         if p["cashed_out"]:
             return await interaction.response.send_message("❌ Already cashed out!", ephemeral=True)
-        if self.active_view.current_mult >= p["crash_point"]:
+
+        # Cash out at the multiplier currently on display: the player's click
+        # always pays out exactly what they saw, instead of the value of a
+        # tick that fired between their click and the button processing it.
+        mult = self.active_view.current_mult
+        if mult >= p["crash_point"]:
             return await interaction.response.send_message("❌ You already crashed!", ephemeral=True)
 
         p["cashed_out"] = True
-        p["cash_mult"] = self.active_view.current_mult
-        p["winnings"] = int(p["bet"] * self.active_view.current_mult)
+        p["cash_mult"] = mult
+        p["winnings"] = int(p["bet"] * mult)
         await EconomyDB.update_balance(uid, wallet=p["winnings"], description="Crash Cashout")
         await EconomyDB.record_game(won=True)
 
@@ -1133,13 +1167,12 @@ class Gambling(commands.Cog):
 
         while not active_game.all_done:
             await asyncio.sleep(0.9)
-            active_game.current_mult = round(active_game.current_mult + 0.15 + (active_game.current_mult * 0.05), 2)
+            active_game.tick()
 
-            all_settled = True
-            for uid, p in active_game.players.items():
-                if not p["cashed_out"] and active_game.current_mult < p["crash_point"]:
-                    all_settled = False
-
+            all_settled = all(
+                p["cashed_out"] or active_game.current_mult >= p["crash_point"]
+                for p in active_game.players.values()
+            )
             if all_settled or active_game.current_mult >= 100.0:
                 active_game.all_done = True
 

@@ -2,8 +2,10 @@ import asyncio
 import html
 import json
 import logging
+import os
 import random
 import re
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
@@ -25,6 +27,31 @@ API_TIMEOUT = 30
 MAX_RESULTS = 25
 
 EMBED_COLOR = discord.Color.from_str("#2b2d31")
+
+RADIO_SETTINGS_PATH = Path(__file__).resolve().parent.parent / "radio_settings.json"
+
+AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
+
+QUEUE_HINT = (
+    "-# **Queue a song:** just type the song name in this channel — "
+    "or drop an MP3 file here and it'll be queued up next!"
+)
+
+
+def text_display(content: str) -> discord.ui.TextDisplay:
+    return discord.ui.TextDisplay(content=content)
+
+
+def small_separator() -> discord.ui.Separator:
+    return discord.ui.Separator(spacing=discord.SeparatorSpacing.small)
+
+
+def simple_view(content: str, *, timeout: int = 60) -> discord.ui.LayoutView:
+    view = discord.ui.LayoutView(timeout=timeout)
+    container = discord.ui.Container(accent_color=EMBED_COLOR)
+    container.add_item(text_display(content))
+    view.add_item(container)
+    return view
 
 
 def clean(value: Any):
@@ -350,7 +377,7 @@ def song_alt_names(song):
 
 def strip_recorded_prefix(value: str) -> str:
     cleaned = re.sub(
-        r"^recorded[:\s-]*",
+        r"^recorded[:\\s-]*",
         "",
         value.strip(),
         count=1,
@@ -536,7 +563,7 @@ def build_radio_details(song: Any, player: "RadioPlayer") -> str:
 
     queue_count = len(player.queue)
     queue_label = f"{queue_count} song" if queue_count == 1 else f"{queue_count} songs"
-    mode_text = "Paused" if player.paused else "Playing (Shuffle)"
+    mode_text = "Paused" if player.paused else "Playing"
     loop_text = "On" if player.loop else "Off"
     fields.append(f"**Radio Status**\n{mode_text} · Loop: {loop_text} · Queue: {queue_label}")
 
@@ -575,7 +602,7 @@ class JuiceWRLDAPI:
             return None
 
     async def get_random_song(self) -> dict | None:
-        """Retrieves a true random song across all eras using juicewrldapi's radio endpoint[span_0](start_span)[span_0](end_span)."""
+        """Retrieves a true random song across all eras using juicewrldapi's radio endpoint."""
         for _ in range(12):
             data = await self.request(RADIO_RANDOM_ENDPOINT)
             if not data or not isinstance(data, dict):
@@ -595,7 +622,7 @@ class JuiceWRLDAPI:
 
             return song_data
 
-        # Fallback across all 28+ catalog pages instead of sticking to page 1[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
+        # Fallback across all 28+ catalog pages instead of sticking to page 1
         try:
             random_page = random.randint(1, 28)
             page_data = await self.request(SONGS_ENDPOINT, params={"page": random_page, "page_size": 50})
@@ -677,23 +704,47 @@ class RadioPlayer:
         self.paused = False
         self.message = None
         self.last_song = None
-        self.starting_song = False
+        self._advance_lock = asyncio.Lock()
+        self._skip_requested = False
 
     def add_to_queue(self, song):
         self.queue.append(song)
 
-    def clear_queue(self):
-        self.queue.clear()
-
     async def get_next_song(self):
+        """Pop the next track: queued requests first, then a random song."""
         if self.queue:
             return self.queue.pop(0)
         return await self.cog.api.get_random_song()
 
+    async def _advance(self):
+        """Pick and play the next track. Serialized so two triggers can never
+        interleave and drop or skip queue entries."""
+        async with self._advance_lock:
+            if not self.voice or not self.voice.is_connected():
+                return
+            if self.voice.is_playing() or self.voice.is_paused():
+                return
+
+            replay = self.loop and self.current_song is not None and not self._skip_requested
+            self._skip_requested = False
+            if replay:
+                await self.play_song(self.current_song)
+                return
+
+            attempts = 0
+            while attempts < 5:
+                attempts += 1
+                song = await self.get_next_song()
+                if not song:
+                    await self.update_message()
+                    return
+                if await self.play_song(song):
+                    return
+            await self.update_message()
+
     async def play_song(self, song):
         if not self.voice or not self.voice.is_connected():
             return False
-        self.starting_song = True
         try:
             if not song.get("is_custom"):
                 song_id = first_value(
@@ -747,33 +798,29 @@ class RadioPlayer:
         except Exception as exc:
             logger.exception("[Radio Play Error] %s", exc)
             return False
-        finally:
-            self.starting_song = False
 
     async def song_finished(self, error=None):
         await asyncio.sleep(0.5)
         if not self.voice or not self.voice.is_connected():
             return
-        if self.loop and self.current_song:
-            await self.play_song(self.current_song)
-            return
-        next_song = await self.get_next_song()
-        if not next_song:
-            self.current_song = None
-            self.current_url = None
-            await self.update_message()
-            return
-        success = await self.play_song(next_song)
-        if not success:
-            await self.song_finished()
+        await self._advance()
 
     async def skip(self):
         if not self.voice:
             return
         if not self.voice.is_playing() and not self.voice.is_paused():
             return
-        self.loop = False
+        self._skip_requested = True
         self.voice.stop()
+
+    async def play(self):
+        """Resume a paused stream, or start the next track if idle."""
+        if self.voice and self.voice.is_paused():
+            self.voice.resume()
+            self.paused = False
+            await self.update_message()
+            return
+        await self._advance()
 
     async def pause(self):
         if self.voice and self.voice.is_playing():
@@ -787,27 +834,29 @@ class RadioPlayer:
             self.paused = False
             await self.update_message()
 
-    async def stop(self):
-        self.loop = False
-        self.clear_queue()
-        self.current_song = None
-        self.current_url = None
-        if self.voice:
-            if self.voice.is_playing() or self.voice.is_paused():
-                self.voice.stop()
-            if self.voice.is_connected():
-                await self.voice.disconnect()
-            self.voice = None
-        await self.update_message()
-
     async def update_message(self):
-        if not self.message:
-            return
         try:
             view = RadioView(self)
-            await self.message.edit(view=view)
-        except Exception as exc:
-            logger.exception("[Radio View Error] %s", exc)
+            if self.message is not None:
+                await self.message.edit(view=view)
+            else:
+                channel = self.cog.get_radio_channel(self.guild_id)
+                if channel is None:
+                    return
+                self.message = await channel.send(view=view)
+                await self.cog.update_settings_message(self.guild_id, self.message.id)
+        except discord.NotFound:
+            self.message = None
+            channel = self.cog.get_radio_channel(self.guild_id)
+            if channel is None:
+                return
+            try:
+                self.message = await channel.send(view=RadioView(self))
+                await self.cog.update_settings_message(self.guild_id, self.message.id)
+            except Exception:
+                logger.exception("[Radio] Could not repost the radio UI")
+        except Exception:
+            logger.exception("[Radio View Error]")
 
 
 class RadioView(discord.ui.LayoutView):
@@ -818,15 +867,19 @@ class RadioView(discord.ui.LayoutView):
 
         if not song:
             container.add_item(
-                discord.ui.TextDisplay(
+                text_display(
                     "# Juice WRLD Radio\n"
-                    "-# Nothing is playing right now."
+                    "-# Nothing is playing right now.\n\n"
+                    + QUEUE_HINT
                 )
             )
+            container.add_item(small_separator())
             container.add_item(
                 discord.ui.ActionRow(
-                    RequestButton(player),
-                    UploadButton(player),
+                    PlayButton(player),
+                    PauseButton(player),
+                    NextButton(player),
+                    LoopButton(player),
                 )
             )
             self.add_item(container)
@@ -845,63 +898,68 @@ class RadioView(discord.ui.LayoutView):
         else:
             container.add_item(discord.ui.TextDisplay(header))
 
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(small_separator())
 
         details = build_radio_details(song, player)
         if details:
             container.add_item(discord.ui.TextDisplay(details))
 
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(small_separator())
 
         container.add_item(
             discord.ui.ActionRow(
-                PreviousButton(player),
+                PlayButton(player),
                 PauseButton(player),
-                SkipButton(player),
+                NextButton(player),
                 LoopButton(player),
             )
         )
-        container.add_item(
-            discord.ui.ActionRow(
-                StopButton(player),
-                RequestButton(player),
-                UploadButton(player),
-            )
-        )
+        container.add_item(text_display(QUEUE_HINT))
         self.add_item(container)
 
 
-class PreviousButton(discord.ui.Button):
+class PlayButton(discord.ui.Button):
     def __init__(self, player):
         self.player = player
-        super().__init__(label="Previous", style=discord.ButtonStyle.secondary)
+        playing = bool(player.voice and player.voice.is_playing())
+        super().__init__(
+            emoji="▶️",
+            style=discord.ButtonStyle.success,
+            disabled=playing,
+            custom_id="radio_play",
+        )
 
     async def callback(self, interaction):
         await interaction.response.defer()
-        if self.player.current_song:
-            if self.player.voice:
-                self.player.voice.stop()
-            await self.player.play_song(self.player.current_song)
+        await self.player.play()
 
 
 class PauseButton(discord.ui.Button):
     def __init__(self, player):
         self.player = player
-        label = "Resume" if player.paused else "Pause"
-        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        playing = bool(player.voice and player.voice.is_playing())
+        super().__init__(
+            emoji="⏸️",
+            style=discord.ButtonStyle.secondary,
+            disabled=not playing,
+            custom_id="radio_pause",
+        )
 
     async def callback(self, interaction):
         await interaction.response.defer()
-        if self.player.paused:
-            await self.player.resume()
-        else:
-            await self.player.pause()
+        await self.player.pause()
 
 
-class SkipButton(discord.ui.Button):
+class NextButton(discord.ui.Button):
     def __init__(self, player):
         self.player = player
-        super().__init__(label="Skip", style=discord.ButtonStyle.secondary)
+        active = bool(player.voice and (player.voice.is_playing() or player.voice.is_paused()))
+        super().__init__(
+            emoji="⏭️",
+            style=discord.ButtonStyle.secondary,
+            disabled=not active,
+            custom_id="radio_next",
+        )
 
     async def callback(self, interaction):
         await interaction.response.defer()
@@ -912,8 +970,9 @@ class LoopButton(discord.ui.Button):
     def __init__(self, player):
         self.player = player
         super().__init__(
-            label=f"Loop: {'On' if player.loop else 'Off'}",
-            style=discord.ButtonStyle.secondary,
+            emoji="🔂" if player.loop else "🔁",
+            style=discord.ButtonStyle.success if player.loop else discord.ButtonStyle.secondary,
+            custom_id="radio_loop",
         )
 
     async def callback(self, interaction):
@@ -922,145 +981,83 @@ class LoopButton(discord.ui.Button):
         await self.player.update_message()
 
 
-class StopButton(discord.ui.Button):
-    def __init__(self, player):
-        self.player = player
-        super().__init__(label="Stop", style=discord.ButtonStyle.danger)
-
-    async def callback(self, interaction):
-        await interaction.response.defer()
-        await self.player.stop()
-
-
-class RequestModal(discord.ui.Modal, title="Request a Juice WRLD Song"):
-    song = discord.ui.TextInput(
-        label="Song",
-        placeholder="Enter a Juice WRLD song...",
-        required=True,
-        max_length=100,
-    )
-
-    def __init__(self, player):
-        super().__init__()
+class RadioQueueSelect(discord.ui.Select):
+    def __init__(self, candidates: list[dict], author_id: int, player: RadioPlayer):
+        self.candidates = candidates
+        self.author_id = author_id
         self.player = player
 
-    async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True)
-        query = str(self.song.value).strip()
-        results = await self.player.cog.api.search_songs(query)
-        if not results:
-            await interaction.followup.send(
-                f"Couldn't find **{query}**.",
-                ephemeral=True,
+        options = []
+        for idx, result in enumerate(candidates[:25]):
+            title = song_title(result)
+            era = song_era(result)
+            description = f"Era: {era}"[:100] if era != "N/A" else None
+            options.append(
+                discord.SelectOption(
+                    label=title[:100],
+                    value=str(idx),
+                    description=description,
+                )
             )
-            return
-        wanted = query.casefold()
-        selected = None
-        for result in results:
-            if song_title(result).strip().casefold() == wanted:
-                selected = result
-                break
-        if selected is None:
-            selected = results[0]
-        self.player.add_to_queue(selected)
-        await interaction.followup.send(
-            f"🎵 Added **{song_title(selected)}** to the Juice WRLD Radio queue.\n"
-            f"**{len(self.player.queue)}** requested song(s) up next.",
-            ephemeral=True,
-        )
-        if (
-            self.player.voice
-            and not self.player.voice.is_playing()
-            and not self.player.voice.is_paused()
-        ):
-            next_song = await self.player.get_next_song()
-            if next_song:
-                await self.player.play_song(next_song)
-        await self.player.update_message()
 
-
-class RequestButton(discord.ui.Button):
-    def __init__(self, player):
-        self.player = player
         super().__init__(
-            label="Request",
-            emoji="🎵",
-            style=discord.ButtonStyle.secondary,
-        )
-
-    async def callback(self, interaction):
-        await interaction.response.send_modal(RequestModal(self.player))
-
-
-class UploadButton(discord.ui.Button):
-    def __init__(self, player):
-        self.player = player
-        super().__init__(
-            label="Upload MP3",
-            emoji="📁",
-            style=discord.ButtonStyle.secondary,
+            placeholder="Choose the correct song...",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            "📤 Please upload your audio file (`.mp3`, `.wav`, `.m4a`, etc.) in this channel within 60 seconds.",
-            ephemeral=True,
-        )
-
-        def check(m: discord.Message):
-            return (
-                m.author.id == interaction.user.id
-                and m.channel.id == interaction.channel.id
-                and len(m.attachments) > 0
-            )
-
-        try:
-            msg = await self.player.cog.bot.wait_for("message", timeout=60.0, check=check)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("⏱️ Upload timed out.", ephemeral=True)
-            return
-
-        attachment = msg.attachments[0]
-        valid_exts = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac")
-        if not attachment.filename.lower().endswith(valid_exts):
-            await interaction.followup.send(
-                "❌ Invalid format. Please upload an audio file (`.mp3`, `.wav`, etc.).",
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who requested the song can choose.",
                 ephemeral=True,
             )
             return
 
-        base_name = attachment.filename.rsplit(".", 1)[0]
-        custom_song = {
-            "is_custom": True,
-            "title": base_name,
-            "name": base_name,
-            "url": attachment.url,
-            "era": "Uploaded Audio",
-            "category": "Custom",
-        }
+        if self.view:
+            self.view.selected = True
+            self.view.stop()
 
-        self.player.add_to_queue(custom_song)
-        await interaction.followup.send(
-            f"🎵 Added **{custom_song['title']}** to the radio queue.\n"
-            f"**{len(self.player.queue)}** song(s) up next.",
-            ephemeral=True,
-        )
+        await interaction.response.defer()
+        chosen = self.candidates[int(self.values[0])]
+        self.player.add_to_queue(chosen)
+        await self.player._advance()
+        await self.player.update_message()
 
         try:
-            await msg.delete()
+            await interaction.message.delete()
         except discord.DiscordException:
             pass
 
-        if (
-            self.player.voice
-            and not self.player.voice.is_playing()
-            and not self.player.voice.is_paused()
-        ):
-            next_song = await self.player.get_next_song()
-            if next_song:
-                await self.player.play_song(next_song)
 
-        await self.player.update_message()
+class RadioQueueSelectView(discord.ui.LayoutView):
+    def __init__(self, query: str, candidates: list[dict], author_id: int, player: RadioPlayer):
+        super().__init__(timeout=60)
+        self.selected = False
+        self.message: discord.Message | None = None
+
+        container = discord.ui.Container(accent_color=EMBED_COLOR)
+        container.add_item(
+            text_display(
+                f"Found **{len(candidates)}** matching songs for **{query}**. "
+                f"Select the correct song from the dropdown below:"
+            )
+        )
+        container.add_item(
+            discord.ui.ActionRow(RadioQueueSelect(candidates, author_id, player))
+        )
+        self.add_item(container)
+
+    async def on_timeout(self):
+        if self.selected or not self.message:
+            return
+        try:
+            await self.message.edit(
+                view=simple_view("⏱️ Selection timed out. Send the song name again to queue it.")
+            )
+        except Exception:
+            pass
 
 
 class Radio(commands.Cog):
@@ -1068,11 +1065,75 @@ class Radio(commands.Cog):
         self.bot = bot
         self.api = JuiceWRLDAPI()
         self.players = {}
+        self._settings = self._load_settings()
+        self._ready_done = False
+
+    # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+
+    def _load_settings(self) -> dict:
+        try:
+            with open(RADIO_SETTINGS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self):
+        tmp = RADIO_SETTINGS_PATH.with_suffix(".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, indent=2)
+            os.replace(tmp, RADIO_SETTINGS_PATH)
+        except Exception:
+            logger.exception("[Radio] Could not save radio settings")
+
+    def set_radio_channel(self, guild_id: int, channel_id: int):
+        key = str(guild_id)
+        entry = self._settings.setdefault(key, {})
+        entry["channel_id"] = channel_id
+        entry.pop("message_id", None)
+        entry.pop("voice_channel_id", None)
+        self._save_settings()
+
+    def update_settings_message(self, guild_id: int, message_id: int):
+        entry = self._settings.setdefault(str(guild_id), {})
+        entry["message_id"] = message_id
+        self._save_settings()
+
+    def update_settings_voice(self, guild_id: int, voice_channel_id: int):
+        entry = self._settings.setdefault(str(guild_id), {})
+        entry["voice_channel_id"] = voice_channel_id
+        self._save_settings()
+
+    def get_radio_channel(self, guild_id: int):
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return None
+        entry = self._settings.get(str(guild_id)) or {}
+        channel = guild.get_channel(entry.get("channel_id") or 0)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        return None
+
+    # ------------------------------------------------------------------
+    # Player helpers
+    # ------------------------------------------------------------------
 
     def get_player(self, guild_id):
         if guild_id not in self.players:
             self.players[guild_id] = RadioPlayer(self, guild_id)
         return self.players[guild_id]
+
+    async def _auto_delete(self, message, delay: float = 8.0):
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except discord.DiscordException:
+            pass
 
     async def resolve_playable_file(self, song):
         if song.get("is_custom"):
@@ -1176,65 +1237,251 @@ class Radio(commands.Cog):
 
         return None
 
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
     @commands.command(name="radio", aliases=["rd", "wrldradio"])
     async def radio(self, ctx):
         if not ctx.author.voice:
-            view = discord.ui.LayoutView(timeout=60)
-            container = discord.ui.Container(accent_color=EMBED_COLOR)
-            container.add_item(
-                discord.ui.TextDisplay("❌ You need to be in a voice channel first.")
-            )
-            view.add_item(container)
-            return await ctx.send(view=view)
+            return await ctx.send(view=simple_view("❌ You need to be in a voice channel first."))
 
         channel = ctx.author.voice.channel
         player = self.get_player(ctx.guild.id)
 
         try:
-            if player.voice:
-                if (
-                    player.voice.is_connected()
-                    and player.voice.channel.id != channel.id
-                ):
+            if player.voice and player.voice.is_connected():
+                if player.voice.channel.id != channel.id:
                     await player.voice.move_to(channel)
             else:
                 player.voice = await channel.connect()
-        except Exception as exc:
-            logger.exception("[Radio Voice Connect Error] %s", exc)
-            view = discord.ui.LayoutView(timeout=60)
-            container = discord.ui.Container(accent_color=EMBED_COLOR)
-            container.add_item(discord.ui.TextDisplay("❌ Could not connect to your voice channel."))
-            view.add_item(container)
-            return await ctx.send(view=view)
+        except Exception:
+            logger.exception("[Radio Voice Connect Error]")
+            return await ctx.send(view=simple_view("❌ Could not connect to your voice channel."))
 
-        if player.voice.is_playing() or player.voice.is_paused():
-            view = RadioView(player)
-            message = await ctx.send(view=view)
-            player.message = message
+        self.update_settings_voice(ctx.guild.id, channel.id)
+
+        configured = self.get_radio_channel(ctx.guild.id)
+        target = configured or ctx.channel
+        if player.message is None or player.message.channel.id != target.id:
+            try:
+                message = await target.send(view=RadioView(player))
+                player.message = message
+                if configured is not None and target.id == configured.id:
+                    self.update_settings_message(ctx.guild.id, message.id)
+            except Exception:
+                logger.exception("[Radio] Could not send the radio UI")
+
+        await player._advance()
+        confirmation = await ctx.send(
+            view=simple_view(f"✅ Radio connected to **{channel.name}** — it'll keep playing 24/7.")
+        )
+        asyncio.create_task(self._auto_delete(confirmation))
+
+    @commands.command(name="setradio", aliases=["radiochannel"])
+    @commands.has_permissions(manage_guild=True)
+    async def setradio(self, ctx, channel: commands.TextChannelConverter = None):
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            return await ctx.send(view=simple_view("❌ Please pick a text channel."))
+
+        player = self.get_player(ctx.guild.id)
+
+        if ctx.author.voice:
+            voice_channel = ctx.author.voice.channel
+            try:
+                if player.voice and player.voice.is_connected():
+                    if player.voice.channel.id != voice_channel.id:
+                        await player.voice.move_to(voice_channel)
+                else:
+                    player.voice = await voice_channel.connect()
+                self.update_settings_voice(ctx.guild.id, voice_channel.id)
+            except Exception:
+                logger.exception("[Radio Voice Connect Error]")
+                return await ctx.send(view=simple_view("❌ Could not connect to your voice channel."))
+
+        self.set_radio_channel(ctx.guild.id, target.id)
+
+        old_message = player.message
+        try:
+            message = await target.send(view=RadioView(player))
+        except Exception:
+            logger.exception("[Radio] Could not send the radio UI")
+            return await ctx.send(view=simple_view(f"❌ I couldn't send the radio UI to {target.mention}."))
+
+        player.message = message
+        self.update_settings_message(ctx.guild.id, message.id)
+
+        if old_message is not None and old_message.id != message.id:
+            try:
+                await old_message.delete()
+            except discord.DiscordException:
+                pass
+
+        await player._advance()
+
+        confirmation = await ctx.send(
+            view=simple_view(
+                f"✅ Radio UI set to {target.mention}.\n"
+                "Type a song name in that channel to queue it — or drop an MP3 file!"
+            )
+        )
+        asyncio.create_task(self._auto_delete(confirmation))
+
+    # ------------------------------------------------------------------
+    # Channel message queueing
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        if not message.guild or not isinstance(message.channel, discord.TextChannel):
             return
 
-        song = await player.get_next_song()
-        if not song:
-            view = discord.ui.LayoutView(timeout=60)
-            container = discord.ui.Container(accent_color=EMBED_COLOR)
-            container.add_item(
-                discord.ui.TextDisplay("❌ I couldn't find any songs in the Juice WRLD API.")
-            )
-            view.add_item(container)
-            return await ctx.send(view=view)
+        entry = self._settings.get(str(message.guild.id))
+        if not entry or message.channel.id != entry.get("channel_id"):
+            return
 
-        view = RadioView(player)
-        message = await ctx.send(view=view)
-        player.message = message
-        success = await player.play_song(song)
-        if not success:
-            error_view = discord.ui.LayoutView(timeout=60)
-            container = discord.ui.Container(accent_color=EMBED_COLOR)
-            container.add_item(
-                discord.ui.TextDisplay("❌ I couldn't find a playable audio file for the selected song.")
-            )
-            error_view.add_item(container)
-            await message.edit(view=error_view)
+        prefixes = self.bot.command_prefix
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        if message.content and any(message.content.startswith(p) for p in prefixes):
+            return
+
+        player = self.get_player(message.guild.id)
+
+        audio = [
+            a for a in message.attachments
+            if a.filename.lower().endswith(AUDIO_EXTS)
+        ]
+
+        if audio:
+            attachment = audio[0]
+            base_name = attachment.filename.rsplit(".", 1)[0].replace("_", " ")
+            custom_song = {
+                "is_custom": True,
+                "title": base_name,
+                "name": base_name,
+                "url": attachment.url,
+                "era": "Uploaded Audio",
+                "category": "Custom",
+            }
+            player.add_to_queue(custom_song)
+            await self._try_delete(message)
+            await player._advance()
+            await player.update_message()
+            return
+
+        query = message.content.strip()
+        if not query:
+            return
+
+        results = await self.api.search_songs(query)
+        if not results:
+            await self._try_delete(message)
+            try:
+                await message.channel.send(
+                    view=simple_view(f"❌ Couldn't find **{query}**. Queue it again with the right name!")
+                )
+            except discord.DiscordException:
+                pass
+            return
+
+        wanted = query.casefold()
+        exact_match = next(
+            (
+                result
+                for result in results
+                if song_title(result).strip().casefold() == wanted
+            ),
+            None,
+        )
+
+        if len(results) == 1 or exact_match is not None:
+            song = exact_match or results[0]
+            player.add_to_queue(song)
+            await self._try_delete(message)
+            await player._advance()
+            await player.update_message()
+            return
+
+        await self._try_delete(message)
+        dropdown_view = RadioQueueSelectView(
+            query=query,
+            candidates=results,
+            author_id=message.author.id,
+            player=player,
+        )
+        try:
+            dropdown_view.message = await message.channel.send(view=dropdown_view)
+        except discord.DiscordException:
+            pass
+
+    @staticmethod
+    async def _try_delete(message: discord.Message):
+        try:
+            await message.delete()
+        except discord.DiscordException:
+            pass
+
+    # ------------------------------------------------------------------
+    # Startup restore
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._ready_done:
+            return
+        self._ready_done = True
+        await self._restore_uis()
+
+    async def _restore_uis(self):
+        changed = False
+        for guild_id_str, entry in list(self._settings.items()):
+            guild = self.bot.get_guild(int(guild_id_str))
+            if guild is None:
+                continue
+            channel = guild.get_channel(entry.get("channel_id") or 0)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            player = self.get_player(guild.id)
+
+            # Clear the stale UI message from the previous session.
+            old_message_id = entry.get("message_id")
+            if old_message_id:
+                try:
+                    old = await channel.fetch_message(old_message_id)
+                    await old.delete()
+                except discord.DiscordException:
+                    pass
+            player.message = None
+
+            # Reconnect voice so the radio keeps running after a restart.
+            voice_channel_id = entry.get("voice_channel_id")
+            if voice_channel_id:
+                voice_channel = guild.get_channel(voice_channel_id)
+                if isinstance(voice_channel, (discord.VoiceChannel, discord.StageChannel)):
+                    try:
+                        player.voice = await voice_channel.connect()
+                    except Exception:
+                        logger.exception("[Radio] Could not reconnect voice in %s", guild_id_str)
+
+            # Put the reworked UI there.
+            try:
+                message = await channel.send(view=RadioView(player))
+                player.message = message
+                entry["message_id"] = message.id
+                changed = True
+            except Exception:
+                logger.exception("[Radio] Could not repost the UI in %s", guild_id_str)
+
+            if player.voice and player.voice.is_connected():
+                await player._advance()
+
+        if changed:
+            self._save_settings()
 
     def cog_unload(self):
         asyncio.create_task(self.api.close())
@@ -1244,4 +1491,4 @@ class Radio(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(Radio(bot))
+    await bot.add_cog(Radio(bot))

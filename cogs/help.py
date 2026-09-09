@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import EMBED_COLOR, PREFIX
@@ -183,11 +184,13 @@ def _command_example(command: commands.Command, prefix: str) -> str:
     if not example:
         example = getattr(command, "__original_kwargs__", {}).get("example")
     if example:
-        return f"{prefix}{example}"
+        example = str(example).strip()
+        return example if example.startswith(prefix) else f"{prefix}{example}"
     help_text = command.help or ""
     for line in help_text.splitlines():
         if line.lower().startswith("example:"):
-            return f"{prefix}{line.split(':', 1)[1].strip()}"
+            example = line.split(":", 1)[1].strip()
+            return example if example.startswith(prefix) else f"{prefix}{example}"
     return f"{prefix}{command.qualified_name}"
 
 
@@ -642,6 +645,58 @@ class Help(commands.Cog):
         }
         view = build_home_view(self.bot.user, category_map, select_id)
         await ctx.send(view=view)
+
+    @app_commands.command(name="help", description="Show bot help and command categories")
+    @app_commands.describe(command="Optional command name for detailed help")
+    async def help_slash(
+        self,
+        interaction: discord.Interaction,
+        command: str | None = None,
+    ) -> None:
+        if command:
+            target = self.bot.get_command(command.lower())
+            if not target or target.hidden:
+                view = discord.ui.LayoutView(timeout=60)
+                container = discord.ui.Container(accent_color=EMBED_COLOR)
+                container.add_item(
+                    discord.ui.TextDisplay(
+                        f"❌ No command named **{command}** was found."
+                    )
+                )
+                view.add_item(container)
+                await interaction.response.send_message(view=view)
+                return
+
+            await interaction.response.defer()
+            pages = build_command_pages(target, DISPLAY_PREFIX, interaction.user, self.bot)
+            if not pages:
+                await interaction.followup.send("No help available for that command.")
+                return
+            if len(pages) == 1:
+                await interaction.followup.send(embed=pages[0])
+            else:
+                await interaction.followup.send(embed=pages[0])
+            return
+
+        category_map = build_category_map(self.bot)
+        if not category_map:
+            view = discord.ui.LayoutView(timeout=60)
+            container = discord.ui.Container(accent_color=EMBED_COLOR)
+            container.add_item(
+                discord.ui.TextDisplay("No commands are currently loaded.")
+            )
+            view.add_item(container)
+            await interaction.response.send_message(view=view)
+            return
+
+        select_id = os.urandom(16).hex()
+        self._sessions[select_id] = {
+            "user_id": interaction.user.id,
+            "category_map": category_map,
+            "created_at": time.monotonic(),
+        }
+        view = build_home_view(self.bot.user, category_map, select_id)
+        await interaction.response.send_message(view=view)
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction) -> None:

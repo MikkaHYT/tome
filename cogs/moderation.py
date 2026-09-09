@@ -246,7 +246,7 @@ class Moderation(commands.Cog):
         name="tempban",
         aliases=("temporaryban",),
         usage="<member> <time d/h/m/s> [reason]",
-        example=",tban @mikk.a 7d Breaking the rules",
+        example="tban @mikk.a 7d Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -312,7 +312,7 @@ class Moderation(commands.Cog):
     @commands.command(
         name="warn",
         usage="<member> [reason]",
-        example=",warn @mikk.a Breaking the rules",
+        example="warn @mikk.a Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -373,7 +373,7 @@ class Moderation(commands.Cog):
         name="kick",
         aliases=("k",),
         usage="<member> [reason]",
-        example=",kick @mikk.a Breaking the rules",
+        example="kick @mikk.a Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -837,7 +837,7 @@ class Moderation(commands.Cog):
     @commands.command(
         name="stripstaff",
         usage="<member>",
-        example=",stripstaff @mikk.a"
+        example="stripstaff @mikk.a"
     )
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.bot_has_permissions(manage_roles=True)
@@ -925,7 +925,7 @@ class Moderation(commands.Cog):
         name="jail",
         aliases=("j",),
         usage="<member> [time d/h/m/s] [reason]",
-        example=",jail @mikk.a 10m Breaking the rules",
+        example="jail @mikk.a 10m Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -1104,7 +1104,7 @@ class Moderation(commands.Cog):
         name="moderationhistory",
         aliases=("mh", "modhistory",),
         usage="[member]",
-        example=",mh @mikk.a",
+        example="mh @mikk.a",
         invoke_without_command=True
     )
     @commands.has_permissions(manage_messages=True)
@@ -1132,7 +1132,7 @@ class Moderation(commands.Cog):
     @commands.group(
         name="history",
         usage="[member]",
-        example=",history @mikk.a",
+        example="history @mikk.a",
         invoke_without_command=True
     )
     @commands.has_permissions(manage_messages=True)
@@ -1160,7 +1160,7 @@ class Moderation(commands.Cog):
     @history.group(
         name="remove",
         usage="<member> [case ID]",
-        example=",remove @mikk.a 1528",
+        example="remove @mikk.a 1528",
         invoke_without_command=True
     )
     @commands.has_permissions(manage_messages=True)
@@ -1238,7 +1238,7 @@ class Moderation(commands.Cog):
         name="timeout",
         aliases=("tm",),
         usage="<member> [time d/h/m/s] [reason]",
-        example=",tm @mikk.a 10m Breaking the rules",
+        example="tm @mikk.a 10m Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -1617,7 +1617,7 @@ class Moderation(commands.Cog):
         name="imute",
         aliases=("imagemute",),
         usage="<member> [reason]",
-        example=",imute @mikk.a Breaking the rules",
+        example="imute @mikk.a Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,
@@ -2153,7 +2153,7 @@ class Moderation(commands.Cog):
         name="ban",
         aliases=("b",),
         usage="<member> [delete days 0/1/7] [reason]",
-        example=",ban @mikk.a Breaking the rules",
+        example="ban @mikk.a Breaking the rules",
         parameters={
             "silent": {
                 "require_value": False,

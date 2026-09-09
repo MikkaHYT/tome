@@ -11,6 +11,7 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 try:
@@ -1254,6 +1255,94 @@ class SongInfo(commands.Cog):
 
         logger.exception("[SongInfo] Command error: %s", error)
         await ctx.send(f"❌ **SongInfo error:** `{error}`")
+
+    @app_commands.command(name="songinfo", description="Search Juice WRLD songs by metadata")
+    @app_commands.describe(query="Search query (title, instrumental, date, credits)")
+    async def songinfo_slash(
+        self,
+        interaction: discord.Interaction,
+        query: str | None = None,
+    ) -> None:
+        if not query:
+            help_view = simple_view(
+                "# Command: songinfo\n"
+                "-# Search Juice WRLD songs by title, instrumental name, recording date, or credits.\n\n"
+                "**Syntax** · `,songinfo <query>`\n"
+                "**Examples** · `,si xr 5 gz` · `,si june 2019` · `,si gezin`"
+            )
+            await interaction.response.send_message(view=help_view)
+            return
+
+        await interaction.response.send_message(
+            view=simple_view(f"🔍 Searching metadata for **{query}**...")
+        )
+
+        await self._ensure_catalog_index()
+        candidates = self.search_metadata(query)
+
+        if not candidates:
+            session = await self.get_session()
+            try:
+                async with session.get(
+                    SONGS_ENDPOINT,
+                    params={"search": query, "page_size": 10},
+                    headers=HEADERS,
+                ) as resp:
+                    if resp.status == 200:
+                        data = parse_api_json(await resp.text())
+                        results = (
+                            data.get("results", [])
+                            if isinstance(data, dict)
+                            else (data if isinstance(data, list) else [])
+                        )
+                        for s in results:
+                            candidates.append(
+                                {"song": s, "matched_field": "API Title Search"}
+                            )
+            except Exception:
+                pass
+
+        if not candidates:
+            await interaction.edit_original_response(
+                view=simple_view(
+                    f"❌ No songs found matching metadata query **{query}**."
+                )
+            )
+            return
+
+        if len(candidates) == 1:
+            chosen_entry = candidates[0]
+            view = await self.resolve_song_view(
+                chosen_entry["song"],
+                matched_field=chosen_entry["matched_field"],
+            )
+            await interaction.edit_original_response(view=view)
+            return
+
+        dropdown_view = SongSelectView(
+            query=query,
+            candidates=candidates,
+            author_id=interaction.user.id,
+            cog=self,
+        )
+        msg = await interaction.edit_original_response(view=dropdown_view)
+        dropdown_view.message = msg
+
+    @songinfo_slash.error
+    async def songinfo_slash_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        logger.exception("[SongInfo] Slash command error: %s", error)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"❌ **SongInfo error:** `{error}`", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **SongInfo error:** `{error}`", ephemeral=True
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import html
 import json
 import logging
@@ -183,6 +182,74 @@ def clean_match_key(value: str) -> str:
     value = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", "", value)
     value = re.sub(r"\s+(?:protools|session\s*edit|session|studio|edit|v\d+(\.\d+)?)\b", "", value, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", value).strip().lower()
+
+
+# Words that may follow a song title inside a session file name without
+# meaning the file belongs to a *different* song (e.g. "Candles (Take 1)"
+# is still Candles, but "Candles In The Dark" is a different track).
+GENERIC_SESSION_TOKENS = {
+    "session", "studio", "edit", "edits", "demo", "demos", "acapella",
+    "instrumental", "og", "original", "alt", "alternate", "alternative",
+    "v2", "v3", "v4", "v5", "take", "takes", "part", "pt", "full",
+    "cdq", "clean", "explicit", "remaster", "remastered", "remix",
+    "leak", "leaked", "chop", "chopped", "sped", "slowed", "reverb",
+    "pitched", "stem", "stems", "vocals", "final", "finished",
+    "unreleased", "released", "preview", "snippet", "master", "masters",
+    "outro", "intro", "interlude", "feat", "featuring", "ft",
+    "juice", "wrld", "juicewrld",
+}
+
+
+def _name_candidates(name: str) -> list[str]:
+    """Cleaned forms of a session file name: the whole name, the part after
+    the artist separator, and each with a leading or trailing "juice wrld"
+    artist label dropped."""
+    base = name.rsplit(".", 1)[0] if "." in name else name
+    keys = [clean_match_key(base)]
+    if " - " in base:
+        keys.append(clean_match_key(base.rsplit(" - ", 1)[1]))
+
+    output: list[str] = []
+    for key in keys:
+        if key and key not in output:
+            output.append(key)
+        stripped = key
+        if stripped.startswith("juice wrld"):
+            stripped = stripped[len("juice wrld"):].strip()
+        elif stripped.endswith(" juice wrld"):
+            stripped = stripped[: -len(" juice wrld")].strip()
+        if stripped and stripped not in output:
+            output.append(stripped)
+    return output
+
+
+def _title_phrase_match(name: str, target: str) -> bool:
+    """True when the song title appears as a whole-word phrase in the file
+    name with only generic session tags/numbers left over, so similar-but-
+    different songs ("Lean" vs "Lean Wit Me") never match."""
+    target_tokens = target.split()
+    if not target_tokens:
+        return False
+
+    for candidate in _name_candidates(name):
+        cand_tokens = candidate.split()
+        if len(cand_tokens) < len(target_tokens):
+            continue
+        for start in range(len(cand_tokens) - len(target_tokens) + 1):
+            if cand_tokens[start:start + len(target_tokens)] != target_tokens:
+                continue
+            before = cand_tokens[:start]
+            after = cand_tokens[start + len(target_tokens):]
+            leftover = before + after
+            if all(t in GENERIC_SESSION_TOKENS or t.isdigit() for t in leftover):
+                return True
+    return False
+
+
+def _name_matches_song(name: str, target_keys: set[str]) -> bool:
+    if any(c in target_keys for c in _name_candidates(name)):
+        return True
+    return any(_title_phrase_match(name, k) for k in target_keys)
 
 
 def clean_meta_text(value: str) -> str:
@@ -845,43 +912,20 @@ class SessionAPI:
                 continue
 
             name = item.get("name", "")
-            base = name.rsplit(".", 1)[0] if "." in name else name
-            clean_item = clean_match_key(base)
 
-            is_match = False
-
-            if clean_item in target_keys:
-                is_match = True
-
-            if not is_match:
-                for k in target_keys:
-                    if len(k) >= 4 and (k in clean_item or clean_item in k):
-                        is_match = True
-                        break
-
-            if not is_match:
-                for k in target_keys:
-                    score = difflib.SequenceMatcher(None, k, clean_item).ratio()
-                    if era_hint and era_hint.lower() in path.lower():
-                        score += 0.12
-                    if score >= 0.75:
-                        is_match = True
-                        break
-
-            if is_match:
-                seen_paths.add(path)
-                download_url = make_download_url(path)
-                file_entry = {
-                    "name": name,
-                    "path": path,
-                    "kind": item.get("kind", "File"),
-                    "download": download_url,
-                    "size_human": item.get("size_human", ""),
-                }
-                if item.get("kind") == "Studio Session":
-                    studio_sessions.append(file_entry)
-                else:
-                    session_edits.append(file_entry)
+            seen_paths.add(path)
+            download_url = make_download_url(path)
+            file_entry = {
+                "name": name,
+                "path": path,
+                "kind": item.get("kind", "File"),
+                "download": download_url,
+                "size_human": item.get("size_human", ""),
+            }
+            if item.get("kind") == "Studio Session":
+                studio_sessions.append(file_entry)
+            else:
+                session_edits.append(file_entry)
 
         return studio_sessions, session_edits
 
